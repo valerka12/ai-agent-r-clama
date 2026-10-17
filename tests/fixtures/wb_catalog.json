@@ -1,0 +1,8 @@
+{
+  "synthetic": true,
+  "data": {"products": [
+    {"id": 101, "brand": "MVP Example", "name": "Демонстрационный товар", "reviewRating": 4.9, "feedbacks": 250},
+    {"id": 102, "brand": "Unknown Brand", "name": "Непроверенный товар", "reviewRating": 4.8, "feedbacks": 200},
+    {"id": 103, "brand": "Low Rating", "name": "Товар с низким рейтингом", "reviewRating": 3.5, "feedbacks": 200}
+  ]}
+}

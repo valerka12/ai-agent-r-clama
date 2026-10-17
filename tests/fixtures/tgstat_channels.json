@@ -1,0 +1,68 @@
+{
+  "synthetic": true,
+  "channels": [
+    {
+      "info": {
+        "id": 101,
+        "title": "MVP Example Channel",
+        "username": "@example_channel",
+        "link": "t.me/example_channel",
+        "peer_type": "channel",
+        "country": "Россия",
+        "category": "Технологии",
+        "about": "Реклама: @example_manager",
+        "tgstat_restrictions": []
+      },
+      "stat": {
+        "id": 101,
+        "username": "@example_channel",
+        "peer_type": "channel",
+        "participants_count": 2000,
+        "avg_post_reach": 600
+      },
+      "observed_at": "2026-10-17T13:29:04.173523+00:00"
+    },
+    {
+      "info": {
+        "id": 102,
+        "title": "Белорусский пример",
+        "username": "@other_channel",
+        "link": "t.me/other_channel",
+        "peer_type": "channel",
+        "country": "Беларусь",
+        "category": "Технологии",
+        "about": "Реклама: @example_manager",
+        "tgstat_restrictions": []
+      },
+      "stat": {
+        "id": 102,
+        "username": "@other_channel",
+        "peer_type": "channel",
+        "participants_count": 2000,
+        "avg_post_reach": 600
+      },
+      "observed_at": "2026-10-17T13:29:04.173523+00:00"
+    },
+    {
+      "info": {
+        "id": 101,
+        "title": "MVP Example Channel",
+        "username": "@example_channel",
+        "link": "t.me/example_channel",
+        "peer_type": "channel",
+        "country": "Казахстан",
+        "category": "Технологии",
+        "about": "Реклама: @example_manager",
+        "tgstat_restrictions": []
+      },
+      "stat": {
+        "id": 101,
+        "username": "@example_channel",
+        "peer_type": "channel",
+        "participants_count": 2000,
+        "avg_post_reach": 600
+      },
+      "observed_at": "2026-10-17T13:29:04.173523+00:00"
+    }
+  ]
+}
