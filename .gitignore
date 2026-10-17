@@ -1,0 +1,26 @@
+# Окружение Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Секреты и сессии
+.env
+.env.*
+!.env.example
+*.session
+*.session-journal
+
+# Данные, резервные копии и журналы
+data/
+backups/
+logs/
+cache/
+
+# Кэш тестов
+.pytest_cache/
+
+# macOS
+.DS_Store
+# Локальные материалы и архивы
+work/
+outputs/
