@@ -5,17 +5,17 @@
 Внутренние библиотеки и browser_engine должны оставаться рядом с exe.
 На некоторых Windows требуется Microsoft WebView2 Runtime.
 
-Сборка создана под Windows в GitHub Actions, 167 тестов и запуск упакованного
+Сборка создана под Windows в GitHub Actions, 172 теста и запуск упакованного
 процесса агента прошли. Окно на вашем Windows-ПК ещё требует проверки.
 
-[Проверенный запуск сборки](https://github.com/valerka12/ai-agent-r-clama/actions/runs/39127338196)
+[Проверенный запуск сборки](https://github.com/valerka12/ai-agent-r-clama/actions/runs/39129174713)
 
-[Артефакт Windows x64](https://github.com/valerka12/ai-agent-r-clama/actions/runs/39127338196/artifacts/12136592533)
+[Артефакт Windows x64](https://github.com/valerka12/ai-agent-r-clama/actions/runs/39129174713/artifacts/12137810374)
 
 Артефакт GitHub хранится до 25 октября 2026; локальный ZIP не истекает.
 SHA-256 ZIP:
-20414f15ed770b697571b2a4fba3e460c4c582838569a3ef4a4055232fe99d88
+85f9ece660c33a6e0ff85d7bdd2888a3eb52c2026c63ceaa080168959e221e10
 
-База сборки: 4ba91cfbcd28a900327ec0cdbfe7705f70f09f84.
+База сборки: 50b48e9b4e8d227f27b5b6d29081a565a2749397.
 Не переносите .venv или браузерные профили Mac в Windows. Настройте вход на
-целевом компьютере кнопкой «Настроить вход». Сначала используйте режим просмотра.
+целевом компьютере кнопкой «Войти в аккаунт». Сначала используйте режим просмотра.
