@@ -471,9 +471,10 @@ def setup_browser_session(platform):
                     try:
                         page.wait_for_timeout(500)
                     except BrowserError:
-                        if not closed:
+                        if not closed and not page.is_closed():
                             raise
-                if not closed:
+                        break
+                if not closed and not page.is_closed():
                     raise SourceError('Время настройки истекло. Проверьте вход при следующем запуске.')
             finally:
                 if not closed:

@@ -1141,3 +1141,21 @@ class SessionSetupTests(unittest.TestCase):
     def test_setup_cli_forbids_write(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             main(['--setup-session', 'tgstat', '--write'])
+
+
+class SessionWindowCloseTests(unittest.TestCase):
+    def test_closing_page_before_context_close_is_normal_completion(self):
+        from unittest.mock import MagicMock
+        from playwright.sync_api import Error as BrowserError
+        from wb_parser import setup_browser_session
+        engine = MagicMock()
+        context = engine.chromium.launch_persistent_context.return_value
+        page = context.pages[0]
+        page.goto.return_value.status = 200
+        page.wait_for_timeout.side_effect = BrowserError('Target page closed')
+        page.is_closed.return_value = True
+        with tempfile.TemporaryDirectory() as directory, patch('config.CACHE_DIR', Path(directory)), patch('playwright.sync_api.sync_playwright') as api:
+            api.return_value.__enter__.return_value = engine
+            result = setup_browser_session('tgstat')
+        context.close.assert_called_once()
+        self.assertEqual(result['session_status'], 'saved_unverified')
