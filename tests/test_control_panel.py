@@ -347,3 +347,28 @@ class SchedulerTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ExplicitStartTests(unittest.TestCase):
+    def test_enter_in_form_does_not_start_search_but_start_button_does(self):
+        import shutil
+        import subprocess
+        from control_panel import HTML
+        node = shutil.which('node')
+        if node is None:
+            self.skipTest('Node нужен только для проверки событий интерфейса')
+        script = HTML.split('<script>')[1].split('</script>')[0].replace('__TOKEN__', '"test"')
+        harness = r"""
+const assert=require('node:assert/strict');
+const nodes={};function node(){return {value:'',checked:false,options:[],replaceChildren(){},append(){},closest(){return {}},reportValidity(){return true}};}
+global.document={getElementById(id){return nodes[id]??=(node());},createElement:node};
+for(const [id,value] of Object.entries({task:'telegram',source:'tgstat-web',topic:'tech',limit:'1',interval:'60'}))document.getElementById(id).value=value;
+document.getElementById('ru').checked=true;
+let starts=0;global.fetch=async(path,opts)=>{if(path==='/api/start')starts++;return {ok:true,json:async()=>path==='/api/jobs'?{jobs:[]}:{status:'idle'}}};
+global.setInterval=()=>{};
+"""
+        verification = r"""
+(async()=>{await document.getElementById('form').onsubmit({preventDefault(){}});assert.equal(starts,0);await document.getElementById('start').onclick({preventDefault(){}});assert.equal(starts,1);})().catch(e=>{console.error(e);process.exitCode=1});
+"""
+        result = subprocess.run([node, '-e', harness+script+verification], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
