@@ -298,6 +298,28 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(self.scheduler.jobs()[0]['status'], 'running')
         self.scheduler.active = None
 
+    def test_close_waits_for_concurrent_spawn_then_stops_process(self):
+        self.scheduler.add(self.options, 300)
+        entered, release = threading.Event(), threading.Event()
+        def spawn(options):
+            entered.set()
+            release.wait(3)
+        self.controller.start.side_effect = spawn
+        worker = threading.Thread(target=self.scheduler.tick)
+        worker.start()
+        self.assertTrue(entered.wait(2))
+        closer = threading.Thread(target=self.scheduler.close)
+        closer.start()
+        self.assertTrue(closer.is_alive())
+        release.set()
+        worker.join(3)
+        closer.join(3)
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(closer.is_alive())
+        self.controller.stop.assert_called_once()
+        self.assertEqual(self.scheduler.jobs()[0]['status'], 'running')
+        self.scheduler.active = None
+
     def test_cli_service_dispatch_has_no_browser_or_table_write(self):
         from agent import main
         with patch('control_panel.service_main', return_value=0) as run:

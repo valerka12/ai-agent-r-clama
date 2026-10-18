@@ -244,6 +244,7 @@ class Scheduler:
         self.event = threading.Event()
         self.thread = None
         self.error = ''
+        self.guard = threading.Lock()
 
     def _connect(self):
         import sqlite3
@@ -319,7 +320,11 @@ class Scheduler:
         return True
 
     def tick(self):
-        if not self.path.exists():
+        with self.guard:
+            self._tick()
+
+    def _tick(self):
+        if self.event.is_set() or not self.path.exists():
             return
         from contextlib import closing
         now = self.clock()
@@ -352,7 +357,7 @@ class Scheduler:
                 return
             # Единственный владелец lease запускает строго одно задание за раз.
             row = db.execute('SELECT * FROM jobs WHERE enabled=1 AND next_run<=? ORDER BY next_run,id LIMIT 1', (now,)).fetchone()
-            if row is None:
+            if row is None or self.event.is_set():
                 return
             with db:
                 db.execute("UPDATE jobs SET status='running',last_run=? WHERE id=?", (now, row['id']))
@@ -383,6 +388,10 @@ class Scheduler:
         self.event.set()
         if self.thread is not None:
             self.thread.join(timeout=6)
+        with self.guard:
+            self._close_runtime()
+
+    def _close_runtime(self):
         if self.active is not None:
             process = self.controller.process
             self.controller.stop()
