@@ -243,7 +243,7 @@ class SourceIntegrationTests(unittest.TestCase):
             row = writer.read("telegram")[0]
             self.assertEqual(row["Подписчики"], "2000")
             self.assertEqual(row["Контакт"], "")
-            self.assertIn('source_run', (writer.root/"logs"/"agent.log").read_text())
+            self.assertIn('source_run', (writer.root/"logs"/"agent.log").read_text(encoding="utf-8"))
 
     def test_wb_full_pipeline_protects_manual_fields(self):
         product, proofs = brand_data()
@@ -959,7 +959,11 @@ class PersistentBrowserSessionTests(unittest.TestCase):
             first = browser_profile_dir('instagram')
             self.assertEqual(first, browser_profile_dir('instagram'))
             self.assertNotEqual(first, browser_profile_dir('youtube'))
-            self.assertEqual(first.stat().st_mode & 0o777, 0o700)
+            import os
+            if os.name != "nt":
+                self.assertEqual(first.stat().st_mode & 0o777, 0o700)
+            else:
+                self.assertTrue(first.is_dir())
             with self.assertRaises(SourceError):
                 browser_profile_dir('../personal')
 
