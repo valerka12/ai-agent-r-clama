@@ -144,6 +144,24 @@ class PanelControllerTests(unittest.TestCase):
             controller.start(dict(source='twitch-web', countries=['ru'], limit=1))
 
 
+class FailureExplanationTests(unittest.TestCase):
+    def test_access_denial_is_visible_and_does_not_promise_login_will_fix_it(self):
+        from control_panel import explain_failure
+        problem = explain_failure('Источник недоступен: HTTP 403')
+        self.assertEqual(problem['title'], 'Сайт запретил доступ')
+        self.assertIn('пока недоступен', problem['message'])
+
+    def test_missing_session_has_actionable_instruction(self):
+        from control_panel import explain_failure
+        self.assertIn('Войти в аккаунт', explain_failure('auth_required')['message'])
+        self.assertIsNone(explain_failure(''))
+
+    def test_partial_source_error_appears_in_status(self):
+        controller = Controller()
+        controller.state.update(report={'source_error': {'reason': 'HTTP 403'}})
+        self.assertEqual(controller.snapshot()['problem']['title'], 'Сайт запретил доступ')
+
+
 class SchedulerTests(unittest.TestCase):
     def setUp(self):
         import tempfile
