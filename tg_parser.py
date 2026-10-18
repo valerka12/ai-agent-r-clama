@@ -454,7 +454,14 @@ class TGStatWebSource(Source):
         return selected
 
     def collect(self, *, channels=None, category=None, countries=("ru", "by"),
-                limit=5, payload=None, **filters):
+                limit=5, payload=None, keep_session=False, unattended=False, **filters):
+        if type(unattended) is not bool:
+            raise SourceError("unattended должен быть bool.")
+        self.unattended = unattended
+        keep_session = keep_session or unattended
+        if type(keep_session) is not bool:
+            raise SourceError("keep_session должен быть bool.")
+        self.keep_session = keep_session
         if type(limit) is not int or not 1 <= limit <= 10:
             raise SourceError("Браузерный MVP ограничен 1–10 каналами за запуск.")
         if not countries or set(countries) - config.MVP_COUNTRIES:
@@ -497,19 +504,28 @@ class TGStatWebSource(Source):
         os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(config.CACHE_DIR / "ms-playwright"))
         try:
             with sync_playwright() as playwright:
-                browser = playwright.chromium.launch(headless=False)
+                browser = None
+                context = None
                 try:
-                    context = browser.new_context(locale="ru-RU", accept_downloads=False)
+                    if getattr(self, "keep_session", False):
+                        from wb_parser import browser_profile_dir
+                        context = playwright.chromium.launch_persistent_context(
+                            user_data_dir=str(browser_profile_dir("tgstat")),
+                            headless=getattr(self, "unattended", False), locale="ru-RU", accept_downloads=False)
+                    else:
+                        browser = playwright.chromium.launch(headless=False)
+                        context = browser.new_context(locale="ru-RU", accept_downloads=False)
                     page = context.new_page()
                     page.set_default_timeout(20000)
                     first = urls[0] if urls else ("https://by.tgstat.com/" if countries[0] == "by" else "https://tgstat.ru/") + category
                     self._visit(page, first)
-                    self.progress("Открылось отдельное окно Chromium. Войдите в TGStat самостоятельно. Пароли и коды в терминал не вводите.")
-                    self.progress("После входа вернитесь в терминал и нажмите Enter.")
-                    self.prompt("")
-                    # Человек мог перейти на другую страницу при входе.
-                    self.sleep(random.uniform(*config.SOURCE_DELAY_SECONDS))
-                    self._visit(page, first)
+                    if not getattr(self, "keep_session", False):
+                        self.progress("Открылось отдельное окно Chromium. Войдите в TGStat самостоятельно. Пароли и коды в терминал не вводите.")
+                        self.progress("После входа вернитесь в терминал и нажмите Enter.")
+                        self.prompt("")
+                        # Человек мог перейти на другую страницу при входе.
+                        self.sleep(random.uniform(*config.SOURCE_DELAY_SECONDS))
+                        self._visit(page, first)
                     self._ensure_login(page, first)
                     if not urls:
                         for index, country in enumerate(countries):
@@ -535,10 +551,14 @@ class TGStatWebSource(Source):
                         except (SourceError, BrowserError, EOFError, KeyboardInterrupt) as error:
                             message = str(error) if isinstance(error, SourceError) else "Чтение страницы прервано."
                             raise WebCollectionError(message, captures=captures, failed_url=url) from error
-                    context.close()
+                    if browser is not None:
+                        context.close()
                     return captures
                 finally:
-                    browser.close()
+                    if browser is not None:
+                        browser.close()
+                    elif context is not None:
+                        context.close()
         except BrowserError as error:
             raise SourceError("Браузер не смог прочитать страницу. Если Chromium не установлен: PLAYWRIGHT_BROWSERS_PATH=cache/ms-playwright python -m playwright install chromium. Подробности запуска: README.md.") from error
         except (EOFError, KeyboardInterrupt) as error:
@@ -555,6 +575,8 @@ class TGStatWebSource(Source):
         except BrowserTimeout:
             pass
         host = urlsplit(url).hostname
+        if getattr(self, "unattended", False):
+            raise SourceError("auth_required: сессия TGStat недоступна. Требуется отдельное восстановление входа; автономный сбор остановлен без ожидания ввода.")
         self.progress(
             f"Вход на {host} пока не подтверждён. Окно Chromium остаётся открытым. "
             "Завершите вход именно в этом окне; вход в Safari или встроенном браузере не переносится. "

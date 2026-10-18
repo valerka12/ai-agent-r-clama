@@ -87,11 +87,13 @@ def demo_candidates():
 def run_source(source_name, *, writer=None, dry_run=True, payload=None,
                proofs=None, query=None, limit=50, niche=None,
                countries=("ru", "by"), category=None, allow_unofficial=False,
-               tg_filters=None, enrich_sites=False, channels=None, urls=None, interactive_login=False, discover=False):
+               tg_filters=None, enrich_sites=False, channels=None, urls=None, interactive_login=False, discover=False, keep_session=False, unattended=False):
     """Сначала решения источника, затем только принятые кандидаты -> ядро."""
     from wb_parser import WBSource, SourceError, country_code, enrich_website
     from tg_parser import TGStatSource
 
+    if unattended and (not source_name.endswith("-web") or payload is not None or interactive_login):
+        raise ValidationError("Автономный режим требует живой браузерный источник без ручного входа.")
     if not countries or set(countries) - {"ru", "by"}:
         raise ValidationError("Разрешены только страны ru и by.")
     source_failure = None
@@ -127,7 +129,7 @@ def run_source(source_name, *, writer=None, dry_run=True, payload=None,
         try:
             decisions = TGStatWebSource().collect(payload=payload, channels=channels,
                                                    category=category, limit=limit,
-                                                   countries=countries, **(tg_filters or {}))
+                                                   countries=countries, keep_session=keep_session, unattended=unattended, **(tg_filters or {}))
         except WebCollectionError as error:
             decisions = error.decisions
             source_failure = {"reason": str(error), "failed_url": error.failed_url,
@@ -149,7 +151,8 @@ def run_source(source_name, *, writer=None, dry_run=True, payload=None,
         try:
             decisions = collector.collect(urls=urls, payload=payload, proofs=proofs,
                                           countries=countries, limit=limit, niche=niche,
-                                          interactive_login=interactive_login, discover=discover)
+                                          interactive_login=interactive_login, discover=discover,
+                                          keep_session=keep_session, unattended=unattended)
         except BrowserBatchError as error:
             decisions = error.decisions
             source_failure = {"reason": str(error), "collected": len(decisions), "write_blocked": True}
@@ -180,12 +183,16 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Локальный оркестратор кандидатов")
     parser.add_argument("--table", choices=("advertisers", "telegram", "streamers"), default="telegram")
     source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--desktop", action="store_true", help="Открыть настольное приложение")
+    source.add_argument("--dashboard", action="store_true", help="Открыть локальную панель управления")
     source.add_argument("--demo", action="store_true", help="Пример без записи")
     source.add_argument("--input", type=Path, help="JSON-массив кандидатов одной таблицы")
     source.add_argument("--source", choices=("wb", "tgstat", "tgstat-web", "wb-web", "ozon-web", "instagram-web", "youtube-web", "twitch-web", "kick-web"), help="Источник MVP с фильтром качества")
     parser.add_argument("--wb-file", type=Path, help="Сохранённый JSON-каталог WB")
     parser.add_argument("--tg-file", type=Path, help="Разрешённая выгрузка TGStat: info/stat")
     parser.add_argument("--web-file", type=Path, help="Сохранённые видимые снимки TGStat: captures")
+    parser.add_argument("--unattended", action="store_true", help="Без окон и ввода; использовать сохранённую сессию, при необходимости входа остановиться")
+    parser.add_argument("--keep-session", action="store_true", help="Сохранять вход только в отдельном профиле платформы внутри cache/")
     parser.add_argument("--discover", action="store_true", help="Найти карточки в публичном каталоге WB/Ozon/Twitch/Kick")
     parser.add_argument("--interactive-login", action="store_true", help="Разрешить паузу только при необходимом входе (новые браузерные источники)")
     parser.add_argument("--urls", nargs="+", help="Прямые ссылки для браузерных источников кроме TGStat")
@@ -206,6 +213,12 @@ def main(argv=None):
     mode.add_argument("--dry-run", action="store_true", help="Только план (по умолчанию)")
     mode.add_argument("--write", action="store_true", help="Реальная запись через safe_writer")
     args = parser.parse_args(argv)
+    if args.desktop:
+        from desktop import main as desktop_main
+        return desktop_main([])
+    if args.dashboard:
+        from control_panel import main as dashboard_main
+        return dashboard_main()
     limit = args.limit if args.limit is not None else (5 if args.source and args.source.endswith("-web") else 50)
     if args.demo and (args.write or args.table != "telegram"):
         parser.error("Демонстрация разрешена только для Telegram без --write.")
@@ -222,6 +235,10 @@ def main(argv=None):
         parser.error("--web-file требует браузерный источник.")
     if args.channels and args.source != "tgstat-web":
         parser.error("--channels требует --source tgstat-web.")
+    if args.unattended and (not browser_source or args.web_file or args.interactive_login):
+        parser.error("--unattended требует живой браузерный источник и несовместим с --interactive-login.")
+    if args.keep_session and (not browser_source or args.web_file):
+        parser.error("--keep-session требует живой браузерный источник.")
     if args.discover and (args.source not in {"wb-web", "ozon-web", "twitch-web", "kick-web"} or args.urls or args.web_file):
         parser.error("--discover требует wb-web/ozon-web/twitch-web/kick-web и не смешивается с --urls/--web-file.")
     if args.interactive_login and not generic_browser:
@@ -261,7 +278,8 @@ def main(argv=None):
                                     allow_unofficial=args.allow_unofficial_wb,
                                     tg_filters=tg_filters, enrich_sites=args.enrich_sites,
                                     channels=args.channels, urls=args.urls,
-                                    interactive_login=args.interactive_login, discover=args.discover)
+                                    interactive_login=args.interactive_login, discover=args.discover,
+                                    keep_session=args.keep_session, unattended=args.unattended)
             except SourceError as error:
                 parser.exit(1, f"Источник недоступен: {error}\n")
         else:

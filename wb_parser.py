@@ -418,6 +418,22 @@ class BrowserBatchError(SourceError):
         self.decisions = decisions
 
 
+def browser_profile_dir(platform):
+    """Только выделенные профили проекта; личные профили браузеров не используются."""
+    allowed = {'wb', 'ozon', 'instagram', 'youtube', 'twitch', 'kick', 'tgstat'}
+    if platform not in allowed:
+        raise SourceError('Неизвестная платформа профиля браузера.')
+    root = config.CACHE_DIR / 'browser_profiles'
+    path = root / platform
+    for directory in (config.CACHE_DIR, root, path):
+        if directory.is_symlink():
+            raise SourceError('Символьные ссылки для браузерных профилей запрещены.')
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    root.chmod(0o700)
+    path.chmod(0o700)
+    return path
+
+
 class VisibleBrowserSource(Source):
     """Общий браузер для согласованных модулей. Только видимый DOM, без API.
 
@@ -449,7 +465,14 @@ class VisibleBrowserSource(Source):
         return value.rstrip("/")
 
     def collect(self, *, urls=None, payload=None, proofs=None, countries=("ru", "by"),
-                limit=5, niche=None, interactive_login=False, discover=False):
+                limit=5, niche=None, interactive_login=False, discover=False, keep_session=False, unattended=False):
+        if type(unattended) is not bool or (unattended and interactive_login):
+            raise SourceError("Автономный режим несовместим с ручным входом.")
+        self.unattended = unattended
+        keep_session = keep_session or unattended
+        if type(keep_session) is not bool:
+            raise SourceError("keep_session должен быть bool.")
+        self.keep_session = keep_session
         self.discover = discover
         if discover and (urls or payload is not None or not getattr(self, "catalog_url", None)):
             raise SourceError("Автопоиск доступен WB/Ozon/Twitch/Kick и не смешивается с прямыми ссылками/снимками.")
@@ -499,9 +522,16 @@ class VisibleBrowserSource(Source):
         os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(config.CACHE_DIR / "ms-playwright"))
         try:
             with sync_playwright() as engine:
-                browser = engine.chromium.launch(headless=False)
+                browser = None
+                context = None
                 try:
-                    context = browser.new_context(locale="ru-RU", accept_downloads=False)
+                    if getattr(self, "keep_session", False):
+                        context = engine.chromium.launch_persistent_context(
+                            user_data_dir=str(browser_profile_dir(self.platform.lower())),
+                            headless=getattr(self, "unattended", False), locale="ru-RU", accept_downloads=False)
+                    else:
+                        browser = engine.chromium.launch(headless=False)
+                        context = browser.new_context(locale="ru-RU", accept_downloads=False)
                     page = context.new_page()
                     if getattr(self, "discover", False):
                         urls = self._discover_urls(page)
@@ -515,8 +545,8 @@ class VisibleBrowserSource(Source):
                         # Публичные страницы обрабатываются без Enter на каждой карточке.
                         # Кнопка «Войти» в шапке сама по себе не означает закрытый профиль.
                         if self._login_required(page):
-                            if not getattr(self, "interactive_login", False) or not sys.stdin.isatty():
-                                raise SourceError("Нужен вход. Повторите с --interactive-login в обычном терминале.")
+                            if getattr(self, "unattended", False) or not getattr(self, "interactive_login", False) or not sys.stdin.isatty():
+                                raise SourceError("auth_required: сохранённый вход недоступен. Авторизуйте рабочий аккаунт отдельно; автономный сбор не ожидает ввода.")
                             input("Войдите в открытом окне и нажмите Enter один раз. ")
                             if self._login_required(page):
                                 raise SourceError("Вход не завершён; пакет не записан.")
@@ -534,7 +564,10 @@ class VisibleBrowserSource(Source):
                         capture["observed_at"] = datetime.now(timezone.utc).isoformat()
                         consume(capture)
                 finally:
-                    browser.close()
+                    if browser is not None:
+                        browser.close()
+                    elif context is not None:
+                        context.close()
         except (BrowserError, EOFError, KeyboardInterrupt) as error:
             raise SourceError("Браузерный сбор прерван. Запись пакета запрещена.") from error
 

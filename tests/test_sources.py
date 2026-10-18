@@ -952,5 +952,136 @@ class MarketplaceBrowserLayoutTests(unittest.TestCase):
         self.assertEqual(YouTubeWebSource.ready_selector, 'yt-page-header-renderer h1')
 
 
+class PersistentBrowserSessionTests(unittest.TestCase):
+    def test_profile_is_local_private_and_separate(self):
+        from wb_parser import browser_profile_dir
+        with tempfile.TemporaryDirectory() as directory, patch('config.CACHE_DIR', Path(directory) / 'cache'):
+            first = browser_profile_dir('instagram')
+            self.assertEqual(first, browser_profile_dir('instagram'))
+            self.assertNotEqual(first, browser_profile_dir('youtube'))
+            self.assertEqual(first.stat().st_mode & 0o777, 0o700)
+            with self.assertRaises(SourceError):
+                browser_profile_dir('../personal')
+
+    def test_profile_symlink_is_rejected(self):
+        from wb_parser import browser_profile_dir
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / 'cache'
+            cache.mkdir()
+            (cache / 'browser_profiles').symlink_to(Path(directory), target_is_directory=True)
+            with patch('config.CACHE_DIR', cache), self.assertRaises(SourceError):
+                browser_profile_dir('twitch')
+
+    def test_persistent_context_is_used_and_closed_without_prompt(self):
+        from unittest.mock import MagicMock
+        from twitch_parser import TwitchWebSource
+        source = TwitchWebSource()
+        source.keep_session = True
+        source.interactive_login = False
+        engine = MagicMock()
+        context = engine.chromium.launch_persistent_context.return_value
+        page = context.new_page.return_value
+        page.goto.return_value.status = 200
+        page.url = 'https://www.twitch.tv/nix'
+        page.locator.return_value.count.return_value = 0
+        page.locator.return_value.first.evaluate.return_value = {'url': page.url, 'text': 'Nix', 'has_chat': False}
+        with tempfile.TemporaryDirectory() as directory, patch('config.CACHE_DIR', Path(directory) / 'cache'), patch('playwright.sync_api.sync_playwright') as start, patch('builtins.input', side_effect=AssertionError('unexpected prompt')), contextlib.redirect_stderr(io.StringIO()):
+            start.return_value.__enter__.return_value = engine
+            source._browse([page.url], MagicMock())
+        engine.chromium.launch.assert_not_called()
+        engine.chromium.launch_persistent_context.assert_called_once()
+        context.close.assert_called_once()
+
+    def test_import_does_not_create_a_profile(self):
+        from twitch_parser import TwitchWebSource
+        with tempfile.TemporaryDirectory() as directory, patch('config.CACHE_DIR', Path(directory) / 'cache'):
+            TwitchWebSource().collect(payload={'captures': [{'url': 'https://www.twitch.tv/nix', 'text': 'Nix', 'observed_at': datetime.now(timezone.utc).isoformat()}]}, keep_session=True)
+            self.assertFalse((Path(directory) / 'cache').exists())
+
+
+class UnattendedModeTests(unittest.TestCase):
+    def test_all_six_collectors_use_headless_private_profiles(self):
+        from unittest.mock import MagicMock
+        from wb_parser import WBWebSource
+        from ozon_parser import OzonWebSource
+        from instagram_parser import InstagramWebSource
+        from youtube_parser import YouTubeWebSource
+        from twitch_parser import TwitchWebSource
+        from kick_parser import KickWebSource
+        cases = [(WBWebSource, 'https://www.wildberries.ru/catalog/123/detail.aspx'),
+                 (OzonWebSource, 'https://www.ozon.ru/product/item-123'),
+                 (InstagramWebSource, 'https://www.instagram.com/example'),
+                 (YouTubeWebSource, 'https://www.youtube.com/@example'),
+                 (TwitchWebSource, 'https://www.twitch.tv/example'),
+                 (KickWebSource, 'https://kick.com/example')]
+        with tempfile.TemporaryDirectory() as directory, patch('config.CACHE_DIR', Path(directory)/'cache'):
+            for cls, url in cases:
+                with self.subTest(platform=cls.platform):
+                    source = cls()
+                    engine = MagicMock()
+                    context = engine.chromium.launch_persistent_context.return_value
+                    page = context.new_page.return_value
+                    page.url = url
+                    page.goto.return_value.status = 200
+                    page.locator.return_value.count.return_value = 0
+                    capture = {'url': url, 'text': 'example'}
+                    with patch('playwright.sync_api.sync_playwright') as start, patch.object(source, '_capture', return_value=capture), patch('builtins.input', side_effect=AssertionError('prompt forbidden')), contextlib.redirect_stderr(io.StringIO()):
+                        start.return_value.__enter__.return_value = engine
+                        source.collect(urls=[url], unattended=True)
+                    self.assertTrue(engine.chromium.launch_persistent_context.call_args.kwargs['headless'])
+                    self.assertTrue(engine.chromium.launch_persistent_context.call_args.kwargs['user_data_dir'].endswith(cls.platform.lower()))
+                    context.close.assert_called_once()
+
+    def test_tgstat_unattended_uses_persistent_headless_context(self):
+        from unittest.mock import MagicMock
+        from tg_parser import TGStatWebSource
+        engine = MagicMock()
+        context = engine.chromium.launch_persistent_context.return_value
+        context.new_page.return_value.evaluate.return_value = {'url': 'https://tgstat.ru/channel/@example/stat', 'text': 'example'}
+        source = TGStatWebSource(prompt=MagicMock(side_effect=AssertionError('prompt forbidden')), sleep=lambda _: None, progress=lambda _: None)
+        source.unattended = True
+        source.keep_session = True
+        with tempfile.TemporaryDirectory() as directory, patch('config.CACHE_DIR', Path(directory)/'cache'), patch('playwright.sync_api.sync_playwright') as start, patch.object(source, '_visit'), patch.object(source, '_ensure_login'):
+            start.return_value.__enter__.return_value = engine
+            self.assertEqual(len(source._browse(['https://tgstat.ru/channel/@example/stat'], None, ('ru',), 1)), 1)
+        self.assertTrue(engine.chromium.launch_persistent_context.call_args.kwargs['headless'])
+        source.prompt.assert_not_called()
+        context.close.assert_called_once()
+
+    def test_expired_tgstat_session_never_prompts(self):
+        from unittest.mock import MagicMock
+        from playwright.sync_api import TimeoutError as BrowserTimeout
+        from tg_parser import TGStatWebSource
+        source = TGStatWebSource(prompt=MagicMock(side_effect=AssertionError('prompt forbidden')))
+        source.unattended = True
+        page = MagicMock()
+        page.locator.return_value.wait_for.side_effect = BrowserTimeout('expired')
+        with self.assertRaisesRegex(SourceError, 'auth_required'):
+            source._ensure_login(page, 'https://tgstat.ru/channel/@example/stat')
+        source.prompt.assert_not_called()
+
+    def test_expired_login_cannot_write(self):
+        from unittest.mock import MagicMock
+        from wb_parser import VisibleBrowserSource
+        engine = MagicMock()
+        context = engine.chromium.launch_persistent_context.return_value
+        page = context.new_page.return_value
+        page.url = 'https://www.twitch.tv/login'
+        page.goto.return_value.status = 200
+        with tempfile.TemporaryDirectory() as directory, patch('config.CACHE_DIR', Path(directory)/'cache'), patch('playwright.sync_api.sync_playwright') as start, patch('builtins.input', side_effect=AssertionError('prompt forbidden')), contextlib.redirect_stderr(io.StringIO()):
+            start.return_value.__enter__.return_value = engine
+            data = Path(directory)/'storage'
+            report = run_source('twitch-web', urls=['https://www.twitch.tv/example'], limit=1, unattended=True, dry_run=False, writer=SafeWriter(data))
+            self.assertEqual(report['status'], 'stopped')
+            self.assertTrue(report['dry_run'])
+            self.assertIn('auth_required', report['source_error']['reason'])
+            self.assertFalse(data.exists())
+
+    def test_unattended_rejects_interactive_login_and_import(self):
+        for kwargs in ({'interactive_login': True}, {'payload': {'captures': []}}):
+            with self.assertRaises(ValueError):
+                run_source('twitch-web', unattended=True, **kwargs)
+
+
 if __name__ == "__main__":
     unittest.main()

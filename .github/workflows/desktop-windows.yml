@@ -1,0 +1,51 @@
+name: Desktop Windows build
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    env:
+      PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/cache/ms-playwright
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install desktop dependencies
+        run: python -m pip install -r requirements-desktop.txt
+      - name: Test
+        run: python -m unittest discover -s tests -q
+      - name: Install browser engine
+        run: python -m playwright install chromium
+      - name: Build Windows application
+        run: python build_desktop.py
+      - name: Check packaged agent without GUI
+        shell: pwsh
+        run: |
+          @'
+          import json, os, subprocess
+          from pathlib import Path
+          exe=next(Path('outputs').glob('desktop-windows-*/AdResearchAgent/AdResearchAgent.exe')).resolve()
+          job=Path(os.environ['LOCALAPPDATA'])/'AdResearchAgent'/'cache'/'ci-smoke'
+          job.mkdir(parents=True,exist_ok=True)
+          out,err=job/'stdout.txt',job/'stderr.txt'
+          result=subprocess.run([str(exe),'--agent-worker',str(out),str(err),'--demo','--dry-run'],timeout=90)
+          assert result.returncode==2, (result.returncode,err.read_text() if err.exists() else 'no error file')
+          report=json.loads(out.read_text())
+          assert report['dry_run'] is True
+          assert report['summary']['failed']==0
+          print('Packaged worker smoke test passed')
+          '@ | python -
+      - uses: actions/upload-artifact@v6
+        with:
+          name: AdResearchAgent-Windows-x64
+          path: outputs/desktop-windows-*/AdResearchAgent/
+          if-no-files-found: error
+          retention-days: 7
