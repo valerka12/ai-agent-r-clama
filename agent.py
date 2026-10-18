@@ -183,6 +183,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Локальный оркестратор кандидатов")
     parser.add_argument("--table", choices=("advertisers", "telegram", "streamers"), default="telegram")
     source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--setup-session", choices=("tgstat", "wb", "ozon", "instagram", "youtube", "twitch", "kick"), help="Открыть окно первого входа; закройте его после авторизации")
+    source.add_argument("--service", action="store_true", help="Выполнять сохранённые задания без интерфейса")
     source.add_argument("--desktop", action="store_true", help="Открыть настольное приложение")
     source.add_argument("--dashboard", action="store_true", help="Открыть локальную панель управления")
     source.add_argument("--demo", action="store_true", help="Пример без записи")
@@ -213,6 +215,19 @@ def main(argv=None):
     mode.add_argument("--dry-run", action="store_true", help="Только план (по умолчанию)")
     mode.add_argument("--write", action="store_true", help="Реальная запись через safe_writer")
     args = parser.parse_args(argv)
+    if args.setup_session:
+        if args.write or args.unattended:
+            parser.error('Настройка входа несовместима с записью и фоновым сбором.')
+        from wb_parser import SourceError, setup_browser_session
+        try:
+            report = setup_browser_session(args.setup_session)
+        except SourceError as error:
+            parser.exit(1, f"Настройка входа остановлена: {error}\n")
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+    if args.service:
+        from control_panel import service_main
+        return service_main()
     if args.desktop:
         from desktop import main as desktop_main
         return desktop_main([])

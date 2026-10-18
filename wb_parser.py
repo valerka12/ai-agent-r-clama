@@ -434,6 +434,57 @@ def browser_profile_dir(platform):
     return path
 
 
+def setup_browser_session(platform):
+    """Первый вход в выделенный профиль; закрытие окна сохраняет сессию.
+
+    Наличие профиля не доказывает авторизацию. Следующий сбор проверяет доступ.
+    Пароли, OTP и cookies не читаются и не попадают в отчёт.
+    """
+    import os
+    from playwright.sync_api import sync_playwright, Error as BrowserError
+    homes = {
+        'tgstat': 'https://tgstat.ru/', 'wb': 'https://www.wildberries.ru/',
+        'ozon': 'https://www.ozon.ru/', 'instagram': 'https://www.instagram.com/',
+        'youtube': 'https://www.youtube.com/', 'twitch': 'https://www.twitch.tv/',
+        'kick': 'https://kick.com/',
+    }
+    if platform not in homes:
+        raise SourceError('Неизвестная платформа входа.')
+    profile = browser_profile_dir(platform)
+    os.environ.setdefault('PLAYWRIGHT_BROWSERS_PATH', str(config.CACHE_DIR / 'ms-playwright'))
+    closed = False
+    def mark_closed(*args):
+        nonlocal closed
+        closed = True
+    try:
+        with sync_playwright() as engine:
+            context = engine.chromium.launch_persistent_context(
+                user_data_dir=str(profile), headless=False, locale='ru-RU', accept_downloads=False)
+            try:
+                context.on('close', mark_closed)
+                page = context.pages[0] if context.pages else context.new_page()
+                response = page.goto(homes[platform], wait_until='domcontentloaded', timeout=30000)
+                if response is None or response.status >= 400:
+                    raise SourceError('Страница входа недоступна. Восстановите доступ обычным способом.')
+                deadline = time.monotonic() + 840
+                while not closed and time.monotonic() < deadline:
+                    try:
+                        page.wait_for_timeout(500)
+                    except BrowserError:
+                        if not closed:
+                            raise
+                if not closed:
+                    raise SourceError('Время настройки истекло. Проверьте вход при следующем запуске.')
+            finally:
+                if not closed:
+                    context.close()
+    except BrowserError as error:
+        raise SourceError('Не удалось открыть отдельный профиль. Закройте другие процессы этой платформы и проверьте установку Chromium.') from error
+    return {'status': 'completed', 'session_setup': platform, 'session_status': 'saved_unverified',
+            'message': 'Профиль сохранён. Авторизация будет проверена при сборе.',
+            'dry_run': True, 'summary': {'total': 0, 'failed': 0}, 'results': []}
+
+
 class VisibleBrowserSource(Source):
     """Общий браузер для согласованных модулей. Только видимый DOM, без API.
 

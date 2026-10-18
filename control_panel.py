@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import secrets
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -95,8 +96,17 @@ class Controller:
         with self.lock:
             return dict(self.state)
 
-    def start(self, options):
-        args = build_command(options)
+    def start(self, options, *, session_setup=False):
+        if session_setup:
+            source = options.get('source')
+            if source not in SOURCES:
+                raise ValueError('Выберите источник для входа.')
+            interpreter = Path(sys.executable)
+            if sys.platform == 'win32' and interpreter.name.lower() == 'pythonw.exe':
+                interpreter = interpreter.with_name('python.exe')
+            args = [str(interpreter), '-m', 'agent', '--setup-session', source.removesuffix('-web')]
+        else:
+            args = build_command(options)
         with self.lock:
             if self.state['status'] in ('running', 'stopping'):
                 raise ValueError('Сбор уже запущен. Дождитесь завершения или остановите его.')
@@ -221,29 +231,228 @@ class Controller:
         threading.Thread(target=ensure_stopped, daemon=True).start()
 
 
+class Scheduler:
+    """Сохранённые задания. Сбой/неясная запись требуют проверки, а не повтора."""
+    def __init__(self, controller, path=None, clock=None):
+        import time
+        self.controller = controller
+        self.path = Path(path) if path is not None else config.CACHE_DIR / 'autonomy.sqlite3'
+        self.clock = clock or time.time
+        self.owner = secrets.token_hex(16)
+        self.active = None
+        self.lease = False
+        self.event = threading.Event()
+        self.thread = None
+        self.error = ''
+
+    def _connect(self):
+        import sqlite3
+        if self.path.is_symlink() or self.path.parent.is_symlink():
+            raise ValueError('База заданий не должна быть символической ссылкой.')
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(self.path, timeout=5)
+        connection.row_factory = sqlite3.Row
+        if os.name == 'posix':
+            self.path.chmod(0o600)
+        connection.executescript("""
+            CREATE TABLE IF NOT EXISTS jobs (
+                id TEXT PRIMARY KEY, options TEXT NOT NULL, interval_seconds INTEGER NOT NULL,
+                enabled INTEGER NOT NULL, status TEXT NOT NULL, next_run REAL NOT NULL,
+                last_run REAL, report TEXT, error TEXT NOT NULL DEFAULT '');
+            CREATE TABLE IF NOT EXISTS service_lease (
+                id INTEGER PRIMARY KEY CHECK(id=1), owner TEXT NOT NULL, expires REAL NOT NULL);
+        """)
+        return connection
+
+    def add(self, options, interval_seconds):
+        if type(interval_seconds) is not int or not 300 <= interval_seconds <= 604800:
+            raise ValueError('Интервал: от 5 минут до 7 суток.')
+        build_command(options)
+        allowed = {'source', 'countries', 'limit', 'write', 'seed', 'category'}
+        if set(options) - allowed:
+            raise ValueError('Неизвестные параметры задания.')
+        identifier = secrets.token_hex(8)
+        from contextlib import closing
+        with closing(self._connect()) as db, db:
+            if db.execute('SELECT count(*) FROM jobs').fetchone()[0] >= 100:
+                raise ValueError('Максимум 100 сохранённых заданий.')
+            db.execute('INSERT INTO jobs(id,options,interval_seconds,enabled,status,next_run) VALUES(?,?,?,1,?,?)',
+                       (identifier, json.dumps(options, ensure_ascii=False), interval_seconds, 'queued', self.clock()))
+        return identifier
+
+    def jobs(self):
+        if not self.path.exists():
+            return []
+        from contextlib import closing
+        with closing(self._connect()) as db:
+            rows = db.execute('SELECT * FROM jobs ORDER BY next_run,id').fetchall()
+        return [{**dict(row), 'options': json.loads(row['options']),
+                 'report': json.loads(row['report']) if row['report'] else None,
+                 'enabled': bool(row['enabled'])} for row in rows]
+
+    def set_enabled(self, identifier, enabled):
+        if type(enabled) is not bool or not isinstance(identifier, str):
+            raise ValueError('Некорректное состояние задания.')
+        from contextlib import closing
+        with closing(self._connect()) as db, db:
+            row = db.execute('SELECT status FROM jobs WHERE id=?', (identifier,)).fetchone()
+            if row is None:
+                raise ValueError('Задание не найдено.')
+            if row['status'] == 'running':
+                raise ValueError('Сначала остановите текущее задание и дождитесь завершения.')
+            db.execute('UPDATE jobs SET enabled=?,status=?,next_run=? WHERE id=?',
+                       (int(enabled), 'queued' if enabled else 'paused', self.clock(), identifier))
+
+    def _heartbeat(self, db, now):
+        db.execute('BEGIN IMMEDIATE')
+        lease = db.execute('SELECT owner,expires FROM service_lease WHERE id=1').fetchone()
+        if lease and lease['owner'] != self.owner and lease['expires'] > now:
+            db.rollback()
+            return False
+        if not self.lease:
+            # После аварии неизвестно, успел ли writer завершить запись. Не повторяем.
+            db.execute("UPDATE jobs SET status='attention',enabled=0,error=? WHERE status='running'",
+                       ('Предыдущий процесс прерван. Проверьте журнал и бэкапы перед возобновлением.',))
+        db.execute('INSERT OR REPLACE INTO service_lease(id,owner,expires) VALUES(1,?,?)', (self.owner, now + 120))
+        db.commit()
+        self.lease = True
+        return True
+
+    def tick(self):
+        if not self.path.exists():
+            return
+        from contextlib import closing
+        now = self.clock()
+        with closing(self._connect()) as db:
+            if not self._heartbeat(db, now):
+                if self.active is not None:
+                    self.controller.stop()
+                self.lease = False
+                return
+            state = self.controller.snapshot()
+            if self.active is not None:
+                if state['status'] in ('running', 'stopping'):
+                    return
+                report = state.get('report')
+                success = (state['status'] in ('completed', 'attention') and state.get('exit_code') in (0, 2)
+                           and isinstance(report, dict) and report.get('status') == 'completed'
+                           and report.get('summary', {}).get('failed') == 0)
+                saved_report = json.dumps(report, ensure_ascii=False) if report else None
+                if saved_report is not None and len(saved_report.encode('utf-8')) > 200_000:
+                    saved_report = json.dumps({key: report[key] for key in
+                                               ('status', 'summary', 'source', 'source_summary', 'dry_run')
+                                               if key in report} | {'details_truncated': True}, ensure_ascii=False)
+                with db:
+                    db.execute('UPDATE jobs SET status=?,enabled=?,next_run=?+interval_seconds,report=?,error=? WHERE id=?',
+                               ('waiting' if success else 'attention', int(success), now,
+                                saved_report,
+                                state.get('error') or ('' if success else 'Нужна проверка источника или журнала; автоматический повтор отключён.'), self.active))
+                self.active = None
+            if state['status'] in ('running', 'stopping'):
+                return
+            # Единственный владелец lease запускает строго одно задание за раз.
+            row = db.execute('SELECT * FROM jobs WHERE enabled=1 AND next_run<=? ORDER BY next_run,id LIMIT 1', (now,)).fetchone()
+            if row is None:
+                return
+            with db:
+                db.execute("UPDATE jobs SET status='running',last_run=? WHERE id=?", (now, row['id']))
+            self.active = row['id']
+            try:
+                self.controller.start(json.loads(row['options']))
+            except Exception:
+                with db:
+                    db.execute("UPDATE jobs SET status='attention',enabled=0,error=? WHERE id=?",
+                               ('Не удалось запустить процесс. Проверьте установку и параметры.', self.active))
+                self.active = None
+
+    def start(self):
+        if self.thread is not None:
+            return
+        def loop():
+            while not self.event.is_set():
+                try:
+                    self.tick()
+                    self.error = ''
+                except Exception:
+                    self.error = 'Ошибка базы заданий. Автоматический запуск приостановлен.'
+                self.event.wait(1)
+        self.thread = threading.Thread(target=loop, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.event.set()
+        if self.thread is not None:
+            self.thread.join(timeout=6)
+        if self.active is not None:
+            process = self.controller.process
+            self.controller.stop()
+            if process is not None:
+                try:
+                    process.wait(timeout=6)
+                except subprocess.TimeoutExpired:
+                    self.controller._terminate(process, force=True)
+        if self.path.exists() and self.lease:
+            from contextlib import closing
+            with closing(self._connect()) as db, db:
+                # running сохраняется для безопасного восстановления после рестарта.
+                db.execute('DELETE FROM service_lease WHERE owner=?', (self.owner,))
+        self.lease = False
+
+
+def service_main():
+    """Без интерфейса: сохранённые задания, пригодно для systemd/launchd."""
+    controller = Controller()
+    scheduler = Scheduler(controller)
+    def stop_service(signum, frame):
+        scheduler.event.set()
+    previous = {}
+    for name in ('SIGINT', 'SIGTERM'):
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            previous[sig] = signal.signal(sig, stop_service)
+    print('Сервис запущен. Использует сохранённые задания; Ctrl+C для остановки.', flush=True)
+    try:
+        scheduler.start()
+        while not scheduler.event.wait(1):
+            if scheduler.error:
+                print(scheduler.error, file=sys.stderr, flush=True)
+                return 1
+    finally:
+        scheduler.close()
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+    return 0
+
+
 HTML = '''<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Агент · управление</title>
 <style>
 :root{color-scheme:dark;font:15px system-ui;background:#101419;color:#e9edf2}*{box-sizing:border-box}body{margin:0}header{padding:24px 5%;border-bottom:1px solid #303841;display:flex;justify-content:space-between;align-items:center}header small{color:#9aabbc}main{max-width:1180px;margin:32px auto;padding:0 24px;display:grid;grid-template-columns:340px 1fr;gap:24px}section{background:#19212a;border:1px solid #303c48;border-radius:16px;padding:24px}h1{font-size:22px;margin:0}h2{font-size:18px;margin:0 0 20px}label{display:block;margin:16px 0 6px;color:#bfccd9}input,select,textarea,button{font:inherit;border-radius:8px}input[type=number],select,textarea{width:100%;background:#101820;color:inherit;border:1px solid #455464;padding:10px}textarea{resize:vertical;min-height:90px}button{padding:12px 18px;border:0;cursor:pointer;background:#79e0ba;color:#102820;font-weight:650}button.secondary{background:#344252;color:#fff}button:disabled{opacity:.4;cursor:default}.row{display:flex;gap:12px;align-items:center;margin-top:20px}.hint{font-size:13px;color:#9aabbc;line-height:1.6}.badge{background:#2c3b49;padding:7px 12px;border-radius:30px;font-size:13px}.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:22px 0}.metric{padding:18px;background:#101820;border-radius:10px}.metric strong{display:block;font-size:28px}.metric span{font-size:12px;color:#a2b5c7}pre{white-space:pre-wrap;word-break:break-word;font:13px ui-monospace;background:#101820;padding:16px;border-radius:10px;max-height:300px;overflow:auto}.item{border-top:1px solid #344252;padding:15px 0}.item small{display:block;color:#a2b5c7;margin-top:6px}details{margin-top:20px}#notice{color:#ffc585;white-space:pre-wrap}.countries label{display:inline-block;margin-right:18px}.write{padding:12px;border:1px solid #66513c;border-radius:8px;font-size:13px} @media(max-width:800px){main{grid-template-columns:1fr}.cards{grid-template-columns:repeat(3,1fr)}}
 </style><header><h1>Агент / Реклама</h1><small>Локальная панель · РФ и Беларусь</small></header><main><section><h2>Новое задание</h2>
-<form id="form"><label for="source">Источник</label><select id="source"><option value="tgstat-web">Telegram · TGStat</option><option value="wb-web">Wildberries</option><option value="ozon-web">Ozon</option><option value="instagram-web">Instagram</option><option value="youtube-web">YouTube</option><option value="twitch-web">Twitch</option><option value="kick-web">Kick</option></select>
+<form id="form"><label for="source">Источник</label><select id="source"><option value="tgstat-web">Telegram · TGStat</option><option value="wb-web">Wildberries</option><option value="ozon-web">Ozon</option><option value="instagram-web">Instagram</option><option value="youtube-web">YouTube</option><option value="twitch-web">Twitch</option><option value="kick-web">Kick</option></select><button type="button" class="secondary" id="login" style="margin-top:12px">Настроить вход</button><p class="hint">Откроется отдельный браузер. Войдите сами и закройте его окно. Последующие задания используют сохранённую сессию.</p>
 <label for="seed">Каналы или ссылки</label><textarea id="seed" placeholder="@kod_ru или ссылки на профили через пробел"></textarea><p class="hint">Для WB, Ozon, Twitch и Kick можно оставить пустым — агент выберет карточки сам.</p>
 <div id="tg"><label for="category">Или категория TGStat</label><input id="category" placeholder="tech" style="width:100%;padding:10px;background:#101820;border:1px solid #455464;color:white"></div>
 <div class="countries"><label><input id="ru" type="checkbox" checked> РФ</label><label><input id="by" type="checkbox" checked> Беларусь</label></div><label for="limit">Лимит карточек</label><input id="limit" type="number" min="1" max="10" value="4">
-<label class="write"><input id="write" type="checkbox"> Разрешить запись в таблицы</label><p class="hint">По умолчанию — только просмотр. Контакты и ручные поля остаются защищёнными.</p><div class="row"><button id="start">Запустить</button><button type="button" class="secondary" id="stop" disabled>Остановить</button></div></form></section>
-<section><div style="display:flex;justify-content:space-between"><h2>Результат сбора</h2><span id="status" class="badge">Готов к запуску</span></div><p class="hint">Работа без окон и ожидания ввода. Используются сохранённые профили. Первый вход или восстановление сессии выполняется отдельно.</p><p id="notice" role="alert"></p><div class="cards"><div class="metric"><strong id="accepted">—</strong><span>ПРИНЯТО</span></div><div class="metric"><strong id="review">—</strong><span>ПРОВЕРКА</span></div><div class="metric"><strong id="rejected">—</strong><span>ОТКЛОНЕНО</span></div></div><div id="results"><p class="hint">Здесь появятся найденные кандидаты и причины решений.</p></div><details><summary>Подробный отчёт</summary><pre id="report">Нет задания</pre></details><details><summary>Диагностика запуска</summary><pre id="error">Нет сообщений</pre></details></section></main>
+<label class="write"><input id="write" type="checkbox"> Разрешить запись в таблицы</label><p class="hint">По умолчанию — только просмотр. Контакты и ручные поля остаются защищёнными.</p><label for="interval">Повторять каждые (минут)</label><input id="interval" type="number" min="5" max="10080" value="60"><button type="button" class="secondary" id="schedule" style="margin-top:12px">Сохранить в расписание</button><p class="hint">Расписание работает, пока приложение или серверный сервис запущен. После сбоя задания с неясным результатом ставятся на проверку.</p><div class="row"><button id="start">Запустить сейчас</button><button type="button" class="secondary" id="stop" disabled>Остановить</button></div></form></section>
+<section><div style="display:flex;justify-content:space-between"><h2>Результат сбора</h2><span id="status" class="badge">Готов к запуску</span></div><p class="hint">Работа без окон и ожидания ввода. Используются сохранённые профили. Первый вход или восстановление сессии выполняется отдельно.</p><p id="notice" role="alert"></p><div class="cards"><div class="metric"><strong id="accepted">—</strong><span>ПРИНЯТО</span></div><div class="metric"><strong id="review">—</strong><span>ПРОВЕРКА</span></div><div class="metric"><strong id="rejected">—</strong><span>ОТКЛОНЕНО</span></div></div><div id="results"><p class="hint">Здесь появятся найденные кандидаты и причины решений.</p></div><details open><summary>Сохранённые задания</summary><div id="jobs"></div><p id="scheduler-error" class="hint"></p></details><details><summary>Подробный отчёт</summary><pre id="report">Нет задания</pre></details><details><summary>Диагностика запуска</summary><pre id="error">Нет сообщений</pre></details></section></main>
 <script>
 const $=id=>document.getElementById(id),token=__TOKEN__;
 $('source').onchange=()=>{$('tg').hidden=$('source').value!=='tgstat-web';$('notice').textContent='';};
 async function api(path,data){const r=await fetch(path,{method:data?'POST':'GET',headers:{'Content-Type':'application/json','X-Control-Token':token},body:data?JSON.stringify(data):undefined});const value=await r.json();if(!r.ok)throw Error(value.error||'Ошибка запроса');return value;}
-$('form').onsubmit=async e=>{e.preventDefault();$('notice').textContent='';try{await api('/api/start',{source:$('source').value,seed:$('seed').value,category:$('category').value,countries:['ru','by'].filter(x=>$(x).checked),limit:Number($('limit').value),write:$('write').checked});await refresh();}catch(e){$('notice').textContent=e.message;}};
+function options(){return {source:$('source').value,seed:$('seed').value,category:$('category').value,countries:['ru','by'].filter(x=>$(x).checked),limit:Number($('limit').value),write:$('write').checked};}
+$('form').onsubmit=async e=>{e.preventDefault();$('notice').textContent='';try{await api('/api/start',options());await refresh();}catch(e){$('notice').textContent=e.message;}};
+$('schedule').onclick=async()=>{try{await api('/api/jobs/add',{options:options(),interval_seconds:Number($('interval').value)*60});$('notice').textContent='Задание сохранено. Первый запуск начнётся автоматически.';await refreshJobs();}catch(e){$('notice').textContent=e.message;}};
+async function refreshJobs(){try{const value=await api('/api/jobs');$('scheduler-error').textContent=value.error||'';const list=$('jobs');list.replaceChildren();for(const j of value.jobs){const row=document.createElement('div');row.className='item';const text=document.createElement('div');text.textContent=j.options.source+' · '+(j.options.write?'запись':'просмотр')+' · каждые '+j.interval_seconds/60+' мин · '+({queued:'В очереди',running:'Выполняется',waiting:'Ожидает',paused:'Пауза',attention:'Нужна проверка'}[j.status]||j.status);const detail=document.createElement('small');detail.textContent=j.error||(j.enabled?'Следующий запуск: '+new Date(j.next_run*1000).toLocaleString():'Автозапуск отключён');const toggle=document.createElement('button');toggle.className='secondary';toggle.style.marginTop='10px';toggle.textContent=j.enabled?'Пауза':'Возобновить';toggle.disabled=j.status==='running';toggle.onclick=async()=>{try{await api('/api/jobs/toggle',{id:j.id,enabled:!j.enabled});await refreshJobs();}catch(e){$('notice').textContent=e.message;}};row.append(text,detail,toggle);if(j.report){const details=document.createElement('details'),summary=document.createElement('summary'),pre=document.createElement('pre');summary.textContent='Последний отчёт';pre.textContent=JSON.stringify(j.report,null,2);details.append(summary,pre);row.append(details);}list.append(row);}if(!value.jobs.length)list.textContent='Заданий пока нет.';}catch(e){$('scheduler-error').textContent=e.message;}}
+
+$('login').onclick=async()=>{try{await api('/api/session',{source:$('source').value});$('notice').textContent='Войдите в открытом браузере и закройте его окно. Пароли и коды вводите только на сайте.';await refresh();}catch(e){$('notice').textContent=e.message;}};
 $('stop').onclick=async()=>{try{await api('/api/stop',{});await refresh();}catch(e){$('notice').textContent=e.message;}};
-async function refresh(){try{const s=await api('/api/status');const names={idle:'Готов к запуску',running:'Идёт сбор',stopping:'Остановка',completed:'Завершён',attention:'Нужна проверка',cancelled:'Остановлен'};$('status').textContent=names[s.status]||s.status;const busy=['running','stopping'].includes(s.status);$('start').disabled=busy;$('stop').disabled=!busy;const r=s.report||{};const counts=r.source_summary||{};for(const [id,key] of [['accepted','accept'],['review','review'],['rejected','reject']])$(id).textContent=counts[key]??'—';$('report').textContent=s.report?JSON.stringify(s.report,null,2):'Нет отчёта';$('error').textContent=s.error||'Нет сообщений';const err=(s.error||'')+JSON.stringify(r.source_error||{});if(err.includes('auth_required'))$('notice').textContent='Нужен вход в рабочий аккаунт. Задание не ждёт ввода; восстановите сессию отдельно.';const list=$('results');list.replaceChildren();if(s.report){for(const d of (r.decisions||[])){const row=document.createElement('div');row.className='item';const c=d.candidate||{};const title=document.createElement('strong');title.textContent=c['Название компании']||c['Название']||c['Стример']||d.product_observation?.title||'Кандидат без подтверждённого имени';const info=document.createElement('small');info.textContent=({accept:'Принят',review:'Требует проверки',reject:'Отклонён'}[d.decision]||d.decision)+' · '+((d.reasons||[]).join(' / ')||'Проверки пройдены');row.append(title,info);list.append(row);}if(!(r.decisions||[]).length)list.textContent='Нет принятых или рассмотренных кандидатов.';}}catch(e){$('status').textContent='Панель недоступна';}}
-refresh();setInterval(refresh,2000);
+async function refresh(){try{const s=await api('/api/status');const names={idle:'Готов к запуску',running:'Идёт сбор',stopping:'Остановка',completed:'Завершён',attention:'Нужна проверка',cancelled:'Остановлен'};$('status').textContent=names[s.status]||s.status;const busy=['running','stopping'].includes(s.status);$('start').disabled=busy;$('login').disabled=busy;$('stop').disabled=!busy;const r=s.report||{};if(r.session_status==='saved_unverified')$('notice').textContent=r.message;const counts=r.source_summary||{};for(const [id,key] of [['accepted','accept'],['review','review'],['rejected','reject']])$(id).textContent=counts[key]??'—';$('report').textContent=s.report?JSON.stringify(s.report,null,2):'Нет отчёта';$('error').textContent=s.error||'Нет сообщений';const err=(s.error||'')+JSON.stringify(r.source_error||{});if(err.includes('auth_required'))$('notice').textContent='Нужен вход в рабочий аккаунт. Задание не ждёт ввода; восстановите сессию отдельно.';const list=$('results');list.replaceChildren();if(s.report){for(const d of (r.decisions||[])){const row=document.createElement('div');row.className='item';const c=d.candidate||{};const title=document.createElement('strong');title.textContent=c['Название компании']||c['Название']||c['Стример']||d.product_observation?.title||'Кандидат без подтверждённого имени';const info=document.createElement('small');info.textContent=({accept:'Принят',review:'Требует проверки',reject:'Отклонён'}[d.decision]||d.decision)+' · '+((d.reasons||[]).join(' / ')||'Проверки пройдены');row.append(title,info);list.append(row);}if(!(r.decisions||[]).length)list.textContent='Нет принятых или рассмотренных кандидатов.';}}catch(e){$('status').textContent='Панель недоступна';}}
+refresh();refreshJobs();setInterval(refresh,2000);setInterval(refreshJobs,5000);
 </script></html>'''
 
 
 def make_server(controller=None, port=8765):
     controller = controller or Controller()
+    scheduler = Scheduler(controller)
     token = secrets.token_urlsafe(32)
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -282,6 +491,11 @@ def make_server(controller=None, port=8765):
                 self.send(200, HTML.replace('__TOKEN__', json.dumps(token)), html=True)
             elif self.path == '/api/status':
                 self.send(200, controller.snapshot())
+            elif self.path == '/api/jobs':
+                try:
+                    self.send(200, {'jobs': scheduler.jobs(), 'error': scheduler.error})
+                except Exception:
+                    self.send(503, {'error': 'База заданий недоступна; проверьте папку данных.'})
             else:
                 self.send(404, {'error': 'Не найдено.'})
 
@@ -294,16 +508,42 @@ def make_server(controller=None, port=8765):
                     raise ValueError('Нужен небольшой JSON-запрос.')
                 body = json.loads(self.rfile.read(length))
                 if self.path == '/api/start':
+                    if scheduler.active is not None:
+                        raise ValueError('Дождитесь завершения задания расписания.')
                     controller.start(body)
+                elif self.path == '/api/session':
+                    if scheduler.active is not None:
+                        raise ValueError('Дождитесь завершения задания расписания.')
+                    if not isinstance(body, dict):
+                        raise ValueError('Выберите источник.')
+                    controller.start({'source': body.get('source')}, session_setup=True)
                 elif self.path == '/api/stop':
                     controller.stop()
+                elif self.path == '/api/jobs/add':
+                    if not isinstance(body, dict):
+                        raise ValueError('Нужны параметры задания.')
+                    scheduler.add(body.get('options'), body.get('interval_seconds'))
+                elif self.path == '/api/jobs/toggle':
+                    if not isinstance(body, dict):
+                        raise ValueError('Нужны параметры задания.')
+                    scheduler.set_enabled(body.get('id'), body.get('enabled'))
                 else:
                     self.send(404, {'error': 'Не найдено.'})
                     return
                 self.send(200, controller.snapshot())
             except (ValueError, OSError) as error:
                 self.send(400, {'error': str(error)})
-    return ThreadingHTTPServer(('127.0.0.1', port), Handler)
+            except sqlite3.Error:
+                self.send(503, {'error': 'База заданий недоступна. Проверьте папку данных.'})
+    class LocalServer(ThreadingHTTPServer):
+        def server_close(self):
+            try:
+                scheduler.close()
+            finally:
+                super().server_close()
+    server = LocalServer(('127.0.0.1', port), Handler)
+    scheduler.start()
+    return server
 
 
 def main():

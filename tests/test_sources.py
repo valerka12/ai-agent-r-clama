@@ -1089,3 +1089,55 @@ class UnattendedModeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SessionSetupTests(unittest.TestCase):
+    def test_seven_platforms_use_only_dedicated_visible_profiles(self):
+        from unittest.mock import MagicMock
+        from wb_parser import setup_browser_session
+        from playwright.sync_api import Error as BrowserError
+        for platform in ('tgstat', 'wb', 'ozon', 'instagram', 'youtube', 'twitch', 'kick'):
+            with self.subTest(platform=platform), tempfile.TemporaryDirectory() as directory, patch('config.CACHE_DIR', Path(directory)):
+                engine = MagicMock()
+                context = engine.chromium.launch_persistent_context.return_value
+                page = context.pages[0]
+                page.goto.return_value.status = 200
+                callbacks = {}
+                context.on.side_effect = lambda name, callback: callbacks.update({name: callback})
+                def closed(*args):
+                    callbacks['close']()
+                    raise BrowserError('Target closed')
+                page.wait_for_timeout.side_effect = closed
+                with patch('playwright.sync_api.sync_playwright') as api:
+                    api.return_value.__enter__.return_value = engine
+                    report = setup_browser_session(platform)
+                params = engine.chromium.launch_persistent_context.call_args.kwargs
+                self.assertFalse(params['headless'])
+                self.assertEqual(Path(params['user_data_dir']), Path(directory)/'browser_profiles'/platform)
+                self.assertEqual(report['session_status'], 'saved_unverified')
+                self.assertEqual(report['summary']['total'], 0)
+                context.cookies.assert_not_called()
+                context.storage_state.assert_not_called()
+
+    def test_unknown_platform_creates_nothing(self):
+        from wb_parser import setup_browser_session
+        with tempfile.TemporaryDirectory() as directory, patch('config.CACHE_DIR', Path(directory)/'cache'):
+            with self.assertRaises(SourceError):
+                setup_browser_session('../personal')
+            self.assertFalse((Path(directory)/'cache').exists())
+
+    def test_denied_login_page_closes_context_and_never_claims_login(self):
+        from unittest.mock import MagicMock
+        from wb_parser import setup_browser_session
+        engine = MagicMock()
+        context = engine.chromium.launch_persistent_context.return_value
+        context.pages[0].goto.return_value.status = 403
+        with tempfile.TemporaryDirectory() as directory, patch('config.CACHE_DIR', Path(directory)), patch('playwright.sync_api.sync_playwright') as api:
+            api.return_value.__enter__.return_value = engine
+            with self.assertRaises(SourceError):
+                setup_browser_session('tgstat')
+            context.close.assert_called_once()
+
+    def test_setup_cli_forbids_write(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            main(['--setup-session', 'tgstat', '--write'])
