@@ -8,6 +8,8 @@ import sys
 
 
 def main():
+    if sys.stdout is not None and hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     if sys.platform not in ('darwin', 'win32'):
         raise SystemExit('Сборку выполняйте на macOS или Windows.')
     root = Path(__file__).resolve().parent

@@ -22,6 +22,11 @@ class PanelCommandTests(unittest.TestCase):
         self.assertIn('--discover', args)
         self.assertNotIn('--write', args)
 
+    def test_windows_background_launcher_uses_console_interpreter_for_worker(self):
+        with patch.object(sys, 'platform', 'win32'), patch.object(sys, 'executable', 'C:/Python/pythonw.exe'):
+            args = build_command(self.options())
+        self.assertEqual(args[0].replace('\\', '/'), 'C:/Python/python.exe')
+
     def test_write_requires_boolean_and_explicit_selection(self):
         self.assertIn('--write', build_command(self.options(write=True)))
         with self.assertRaises(ValueError):
@@ -106,6 +111,7 @@ class PanelControllerTests(unittest.TestCase):
         self.assertEqual(controller.snapshot()['report']['summary']['total'], 0)
         self.assertNotIn('shell', spawn.call_args.kwargs)
         self.assertIsInstance(spawn.call_args.args[0], list)
+        self.assertEqual(spawn.call_args.kwargs['env']['PYTHONIOENCODING'], 'utf-8')
 
     def test_parallel_start_rejected(self):
         controller = Controller()

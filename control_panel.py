@@ -34,7 +34,10 @@ def _build_command(options):
     seed = options.get('seed', '')
     if not isinstance(seed, str) or len(seed) > 8000:
         raise ValueError('Слишком длинный список ссылок.')
-    args = [sys.executable, '-m', 'agent', '--source', source, '--countries', *dict.fromkeys(countries),
+    interpreter = Path(sys.executable)
+    if sys.platform == 'win32' and interpreter.name.lower() == 'pythonw.exe':
+        interpreter = interpreter.with_name('python.exe')
+    args = [str(interpreter), '-m', 'agent', '--source', source, '--countries', *dict.fromkeys(countries),
             '--limit', str(limit), '--unattended', '--write' if write else '--dry-run']
     if source == 'tgstat-web':
         category = options.get('category', '')
@@ -109,6 +112,7 @@ class Controller:
             try:
                 self.process = subprocess.Popen(args, cwd=config.PROJECT_DIR, stdin=subprocess.DEVNULL,
                                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                                env=dict(os.environ, PYTHONIOENCODING='utf-8', PYTHONUTF8='1'),
                                                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
                                                 start_new_session=(os.name == 'posix'))
             except OSError:
