@@ -37,8 +37,8 @@ jobs:
           job.mkdir(parents=True,exist_ok=True)
           out,err=job/'stdout.txt',job/'stderr.txt'
           result=subprocess.run([str(exe),'--agent-worker',str(out),str(err),'--demo','--dry-run'],timeout=90)
-          assert result.returncode==2, (result.returncode,err.read_text() if err.exists() else 'no error file')
-          report=json.loads(out.read_text())
+          assert result.returncode==2, (result.returncode,err.read_text(encoding='utf-8') if err.exists() else 'no error file')
+          report=json.loads(out.read_text(encoding='utf-8'))
           assert report['dry_run'] is True
           assert report['summary']['failed']==0
           print('Packaged worker smoke test passed')
