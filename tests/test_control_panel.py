@@ -252,17 +252,39 @@ class SchedulerTests(unittest.TestCase):
         self.assertIn('бэкапы', saved['error'])
         other.close()
 
-    def test_auth_failure_pauses_only_failed_task(self):
+    def test_auth_failure_pauses_same_source_but_other_platform_continues(self):
         failed = self.scheduler.add(self.options, 300)
         self.scheduler.tick()
         next_id = self.scheduler.add(dict(self.options, category='games'), 300)
+        other_id = self.scheduler.add(dict(source='twitch-web', countries=['ru'], limit=1), 300)
         self.state.update(status='attention', exit_code=1, error='auth_required', report=None)
         self.scheduler.tick()
         saved = {row['id']: row for row in self.scheduler.jobs()}
         self.assertFalse(saved[failed]['enabled'])
         self.assertEqual(saved[failed]['error'], 'auth_required')
-        self.assertEqual(saved[next_id]['status'], 'running')
+        self.assertEqual(saved[next_id]['status'], 'attention')
+        self.assertFalse(saved[next_id]['enabled'])
+        self.assertEqual(saved[other_id]['status'], 'running')
         self.assertEqual(self.controller.start.call_count, 2)
+
+    def test_partial_http_denial_pauses_other_saved_tasks_of_same_source(self):
+        self.scheduler.add(self.options, 300)
+        self.scheduler.tick()
+        pending = self.scheduler.add(dict(self.options, category='games'), 300)
+        self.complete(status='attention', exit_code=1,
+                      report={'status': 'stopped', 'summary': {'failed': 0},
+                              'source_error': {'reason': 'HTTP 403'}})
+        self.scheduler.tick()
+        saved = {row['id']: row for row in self.scheduler.jobs()}
+        self.assertFalse(saved[pending]['enabled'])
+        self.assertEqual(self.controller.start.call_count, 1)
+
+    def test_access_classifier_does_not_treat_arbitrary_numbers_as_status(self):
+        from control_panel import source_access_blocked
+        for text in ('HTTP 403', 'HTTP 429', 'auth_required', 'На странице проверка доступа.'):
+            self.assertTrue(source_access_blocked(text), text)
+        for text in ('Строка 403 повреждена', 'HTTP 4030', 'HTTP 500', '', None):
+            self.assertFalse(source_access_blocked(text), text)
 
     def test_storage_failure_never_retries_even_with_success_exit_code(self):
         self.scheduler.add(dict(self.options, write=True), 300)
@@ -368,7 +390,51 @@ let starts=0;global.fetch=async(path,opts)=>{if(path==='/api/start')starts++;ret
 global.setInterval=()=>{};
 """
         verification = r"""
-(async()=>{await document.getElementById('form').onsubmit({preventDefault(){}});assert.equal(starts,0);await document.getElementById('start').onclick({preventDefault(){}});assert.equal(starts,1);})().catch(e=>{console.error(e);process.exitCode=1});
+(async()=>{await document.getElementById('form').onsubmit({preventDefault(){}});assert.equal(starts,0);await document.getElementById('start').onclick({preventDefault(){}});assert.equal(starts,1);
+assert.equal(candidateLink('javascript:alert(1)'),null);
+assert.equal(candidateLink('https://user:password@example.com'),null);
+assert.equal(candidateLink('not a link'),null);
+assert.equal(candidateLink('https://t.me/kod_ru'),'https://t.me/kod_ru');
+assert.equal(document.getElementById('download-report').disabled,true);
+let download=null,revoked=null;
+global.Blob=class{constructor(parts,options){this.parts=parts;this.options=options;}};
+URL.createObjectURL=blob=>{assert.deepEqual(JSON.parse(blob.parts[0]),{source:'telegram-public',decisions:[]});return 'blob:test';};
+URL.revokeObjectURL=url=>{revoked=url;};global.setTimeout=fn=>fn();
+const originalCreate=document.createElement;document.createElement=tag=>tag==='a'?{click(){download={href:this.href,name:this.download};}}:originalCreate(tag);
+latestReport={source:'telegram-public',decisions:[]};document.getElementById('download-report').onclick();
+assert.deepEqual(download,{href:'blob:test',name:'agent-report.json'});assert.equal(revoked,'blob:test');
+})().catch(e=>{console.error(e);process.exitCode=1});
 """
         result = subprocess.run([node, '-e', harness+script+verification], capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class PublicSearchPanelTests(unittest.TestCase):
+    def test_public_query_needs_no_session_and_is_dry_run(self):
+        args = build_command(dict(source='telegram-public',countries=['ru','by'],limit=2,query='Беларусь'))
+        self.assertIn('--query', args)
+        self.assertIn('Беларусь', args)
+        self.assertIn('--unattended', args)
+        self.assertIn('--dry-run', args)
+        self.assertNotIn('--keep-session', args)
+
+    def test_public_write_and_login_are_rejected(self):
+        with self.assertRaises(ValueError):
+            build_command(dict(source='telegram-public',countries=['ru'],limit=1,write=True))
+        with self.assertRaises(ValueError):
+            Controller().start({'source':'telegram-public'},session_setup=True)
+
+    def test_direct_channels_take_precedence_over_query(self):
+        args = build_command(dict(source='telegram-public',countries=['by'],limit=1,query='Беларусь',seed='@devby'))
+        self.assertIn('--channels', args)
+        self.assertNotIn('--query', args)
+
+
+class BrowserProblemPanelTests(unittest.TestCase):
+    def test_browser_start_failure_does_not_request_site_login(self):
+        from control_panel import explain_failure
+        reason = 'Chromium не установлен. Переустановите полную сборку.'
+        problem = explain_failure('Источник недоступен: browser_unavailable: ' + reason)
+        self.assertEqual(problem['title'], 'Браузер не запустился')
+        self.assertEqual(problem['message'], reason)
+        self.assertNotIn('Войти в аккаунт', problem['message'])

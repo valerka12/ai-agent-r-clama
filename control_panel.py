@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import config
 
-SOURCES = ('tgstat-web', 'wb-web', 'ozon-web', 'instagram-web', 'youtube-web', 'twitch-web', 'kick-web')
+SOURCES = ('telegram-public', 'tgstat-web', 'wb-web', 'ozon-web', 'instagram-web', 'youtube-web', 'twitch-web', 'kick-web')
 
 
 def _build_command(options):
@@ -40,7 +40,21 @@ def _build_command(options):
         interpreter = interpreter.with_name('python.exe')
     args = [str(interpreter), '-m', 'agent', '--source', source, '--countries', *dict.fromkeys(countries),
             '--limit', str(limit), '--unattended', '--write' if write else '--dry-run']
-    if source == 'tgstat-web':
+    if source == 'telegram-public':
+        from tg_parser import TelegramPublicSource
+        if write:
+            raise ValueError('Публичный поиск пока доступен только для просмотра кандидатов.')
+        query = options.get('query', '')
+        if not isinstance(query, str) or len(query) > 200:
+            raise ValueError('Поисковая фраза: не более 200 символов.')
+        if seed.strip():
+            values = ['@' + TelegramPublicSource.username(value) for value in seed.split()]
+            args += ['--channels', *values]
+        elif query.strip():
+            if len(query.strip()) < 3:
+                raise ValueError('Введите хотя бы 3 символа для поиска.')
+            args += ['--query', query.strip()]
+    elif source == 'tgstat-web':
         category = options.get('category', '')
         if not isinstance(category, str) or len(category) > 40:
             raise ValueError('Некорректная категория.')
@@ -88,6 +102,9 @@ def build_command(options):
 def explain_failure(error):
     """Понятная причина отказа; исходная диагностика остаётся отдельно."""
     text = str(error or '')
+    if 'browser_unavailable:' in text:
+        reason = text.split('browser_unavailable:', 1)[1].strip()
+        return {'title': 'Браузер не запустился', 'message': reason}
     if '403' in text:
         return {'title': 'Сайт запретил доступ', 'message': 'Источник вернул HTTP 403. Данные не получены. Проверьте доступ кнопкой «Войти в аккаунт». Если сайт продолжает отказывать, этот источник пока недоступен программе.'}
     if 'auth_required' in text:
@@ -97,6 +114,13 @@ def explain_failure(error):
     if text:
         return {'title': 'Поиск остановлен', 'message': 'Источник не удалось прочитать. Подробности доступны в диагностике ниже.'}
     return None
+
+
+def source_access_blocked(error):
+    """Только явные отказы доступа, а не произвольные числа в сообщении."""
+    import re
+    return bool(re.search(r'HTTP\s*(?:403|429)\b|\bauth_required\b|На странице проверка доступа|Обнаружена проверка доступа',
+                          str(error or ''), re.IGNORECASE))
 
 
 class Controller:
@@ -114,8 +138,8 @@ class Controller:
     def start(self, options, *, session_setup=False):
         if session_setup:
             source = options.get('source')
-            if source not in SOURCES:
-                raise ValueError('Выберите источник для входа.')
+            if source not in SOURCES or source == 'telegram-public':
+                raise ValueError('Для этого источника вход не требуется либо источник не выбран.')
             interpreter = Path(sys.executable)
             if sys.platform == 'win32' and interpreter.name.lower() == 'pythonw.exe':
                 interpreter = interpreter.with_name('python.exe')
@@ -284,7 +308,7 @@ class Scheduler:
         if type(interval_seconds) is not int or not 300 <= interval_seconds <= 604800:
             raise ValueError('Интервал: от 5 минут до 7 суток.')
         build_command(options)
-        allowed = {'source', 'countries', 'limit', 'write', 'seed', 'category'}
+        allowed = {'source', 'countries', 'limit', 'write', 'seed', 'category', 'query'}
         if set(options) - allowed:
             raise ValueError('Неизвестные параметры задания.')
         identifier = secrets.token_hex(8)
@@ -367,6 +391,15 @@ class Scheduler:
                                ('waiting' if success else 'attention', int(success), now,
                                 saved_report,
                                 state.get('error') or ('' if success else 'Нужна проверка источника или журнала; автоматический повтор отключён.'), self.active))
+                    failure = state.get('error') or ((report or {}).get('source_error') or {}).get('reason', '')
+                    if not success and source_access_blocked(failure):
+                        active_row = db.execute('SELECT options FROM jobs WHERE id=?', (self.active,)).fetchone()
+                        source = json.loads(active_row['options'])['source']
+                        pending = db.execute("SELECT id,options FROM jobs WHERE enabled=1 AND status!='running'").fetchall()
+                        for pending_row in pending:
+                            if json.loads(pending_row['options']).get('source') == source:
+                                db.execute("UPDATE jobs SET enabled=0,status='attention',error=? WHERE id=?",
+                                           ('Источник приостановлен после отказа в доступе. Восстановите доступ и возобновите задание вручную.', pending_row['id']))
                 self.active = None
             if state['status'] in ('running', 'stopping'):
                 return
@@ -452,28 +485,31 @@ HTML = '''<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewp
 :root{color-scheme:dark;font:15px system-ui;background:#101419;color:#e9edf2}*{box-sizing:border-box}body{margin:0}header{padding:24px 5%;border-bottom:1px solid #303841;display:flex;justify-content:space-between;align-items:center}header small{color:#9aabbc}main{max-width:1180px;margin:32px auto;padding:0 24px;display:grid;grid-template-columns:340px 1fr;gap:24px}section{background:#19212a;border:1px solid #303c48;border-radius:16px;padding:24px}h1{font-size:22px;margin:0}h2{font-size:18px;margin:0 0 20px}label{display:block;margin:16px 0 6px;color:#bfccd9}input,select,textarea,button{font:inherit;border-radius:8px}input[type=number],select,textarea{width:100%;background:#101820;color:inherit;border:1px solid #455464;padding:10px}textarea{resize:vertical;min-height:90px}button{padding:12px 18px;border:0;cursor:pointer;background:#79e0ba;color:#102820;font-weight:650}button.secondary{background:#344252;color:#fff}button:disabled{opacity:.4;cursor:default}.row{display:flex;gap:12px;align-items:center;margin-top:20px}.hint{font-size:13px;color:#9aabbc;line-height:1.6}.badge{background:#2c3b49;padding:7px 12px;border-radius:30px;font-size:13px}.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:22px 0}.metric{padding:18px;background:#101820;border-radius:10px}.metric strong{display:block;font-size:28px}.metric span{font-size:12px;color:#a2b5c7}pre{white-space:pre-wrap;word-break:break-word;font:13px ui-monospace;background:#101820;padding:16px;border-radius:10px;max-height:300px;overflow:auto}.item{border-top:1px solid #344252;padding:15px 0}.item small{display:block;color:#a2b5c7;margin-top:6px}details{margin-top:20px}#notice{color:#ffc585;white-space:pre-wrap}.countries label{display:inline-block;margin-right:18px}.write{padding:12px;border:1px solid #66513c;border-radius:8px;font-size:13px} @media(max-width:800px){main{grid-template-columns:1fr}.cards{grid-template-columns:repeat(3,1fr)}}
 </style><header><h1>Агент / Реклама</h1><small>РФ и Беларусь</small></header><main><section><h2>Что сделать?</h2><form id="form">
 <label for="task">Задача</label><select id="task"><option value="telegram">Найти Telegram-каналы</option><option value="advertisers">Найти рекламодателей</option><option value="streamers">Найти стримеров</option></select>
-<label for="source">Платформа</label><select id="source"><option value="tgstat-web">Telegram · TGStat</option><option value="wb-web">Wildberries</option><option value="ozon-web">Ozon</option><option value="instagram-web">Instagram</option><option value="youtube-web">YouTube</option><option value="twitch-web">Twitch</option><option value="kick-web">Kick</option></select>
-<div id="tg"><label for="topic">Тематика каналов</label><select id="topic"><option value="tech">Технологии</option><option value="">Другая категория TGStat</option></select><input id="category" hidden placeholder="Код категории TGStat" style="width:100%;padding:10px;background:#101820;color:white;border:1px solid #455464"><p class="hint">Вместо тематики можно задать конкретные каналы в дополнительных настройках.</p></div>
+<label for="source">Платформа</label><select id="source"><option value="telegram-public">Telegram · публичный поиск кандидатов</option><option value="tgstat-web">Telegram · TGStat</option><option value="wb-web">Wildberries</option><option value="ozon-web">Ozon</option><option value="instagram-web">Instagram</option><option value="youtube-web">YouTube</option><option value="twitch-web">Twitch</option><option value="kick-web">Kick</option></select>
+<div id="public-query" hidden><label for="query">Что искать?</label><input id="query" placeholder="Например: технологии, Беларусь" style="width:100%;padding:10px;background:#101820;color:white;border:1px solid #455464"><p class="hint">Без входа и оплаты. Страна и средний охват требуют проверки, автозапись отключена. Пустая фраза — поиск по словам «Россия» и «Беларусь».</p></div><div id="tg"><label for="topic">Тематика каналов</label><select id="topic"><option value="tech">Технологии</option><option value="">Другая категория TGStat</option></select><input id="category" hidden placeholder="Код категории TGStat" style="width:100%;padding:10px;background:#101820;color:white;border:1px solid #455464"><p class="hint">Вместо тематики можно задать конкретные каналы в дополнительных настройках.</p></div>
 <label for="limit">Сколько проверить</label><input id="limit" type="number" min="1" max="10" value="4">
 <div class="row"><button type="button" id="start">▶ Пуск</button><button type="button" class="secondary" id="stop" disabled>■ Стоп</button></div><p id="task-hint" class="hint">Найдём каналы выбранной тематики и проверим показатели и возможность рекламы.</p>
-<button type="button" class="secondary" id="login">Войти в аккаунт</button><p class="hint">Для первого входа откроется отдельный браузер. Войдите на сайте и закройте его окно. Программа сохранит сессию.</p>
+<button type="button" class="secondary" id="login">Войти в аккаунт</button><p class="hint" id="login-hint">Для первого входа откроется отдельный браузер. Войдите на сайте и закройте его окно. Программа сохранит сессию.</p>
 <details><summary>Дополнительные настройки</summary><label for="seed">Конкретные каналы или ссылки (необязательно)</label><textarea id="seed" placeholder="@kod_ru или ссылки через пробел"></textarea><p class="hint" id="seed-hint">Если указаны каналы, поиск по тематике не используется.</p>
 <div class="countries"><label><input id="ru" type="checkbox" checked> РФ</label><label><input id="by" type="checkbox" checked> Беларусь</label></div>
 <label class="write"><input id="write" type="checkbox"> Сохранять результат в таблицы</label><p class="hint">По умолчанию — просмотр. Ручные поля и заполненные ячейки защищены.</p>
 <label for="interval">Повторять каждые (минут)</label><input id="interval" type="number" min="5" max="10080" value="60"><button type="button" class="secondary" id="schedule" style="margin-top:12px">Включить расписание</button><p class="hint">Работает, пока приложение или серверный сервис включён.</p></details></form></section>
 <section><h2>Ход выполнения</h2><span id="status" class="badge">Готов к запуску</span><p id="notice" role="alert"></p><div id="problem" hidden style="border:1px solid #bf7653;background:#392820;padding:18px;border-radius:10px;margin-top:20px"><strong id="problem-title"></strong><p id="problem-text"></p></div>
 <div class="cards"><div class="metric"><strong id="accepted">—</strong><span>ПОДХОДЯТ</span></div><div class="metric"><strong id="review">—</strong><span>НУЖНА ПРОВЕРКА</span></div><div class="metric"><strong id="rejected">—</strong><span>ОТКЛОНЕНЫ</span></div></div><div id="results"><p class="hint">Выберите задачу и нажмите Пуск.</p></div>
-<details><summary>Расписание</summary><div id="jobs"></div><p id="scheduler-error" class="hint"></p></details><details><summary>Подробный отчёт</summary><pre id="report">Нет задания</pre></details><details><summary>Диагностика</summary><pre id="error">Нет сообщений</pre></details></section></main>
+<details><summary>Расписание</summary><div id="jobs"></div><p id="scheduler-error" class="hint"></p></details><details><summary>Подробный отчёт</summary><button type="button" id="download-report" class="secondary" disabled>Скачать отчёт JSON</button><pre id="report">Нет задания</pre></details><details><summary>Диагностика</summary><pre id="error">Нет сообщений</pre></details></section></main>
 <script>
 const $=id=>document.getElementById(id),token=__TOKEN__;
-const groups={telegram:['tgstat-web'],advertisers:['wb-web','ozon-web','instagram-web','youtube-web'],streamers:['twitch-web','kick-web']};
-function updateSource(){const source=$('source').value;$('tg').hidden=source!=='tgstat-web';const direct=['instagram-web','youtube-web'].includes(source);$('seed').required=direct;if(direct)$('seed').closest('details').open=true;$('seed-hint').textContent=direct?'Для этой платформы нужны прямые ссылки на профили. Самостоятельный поиск ещё не реализован.':source==='tgstat-web'?'Если указаны каналы, поиск по тематике не используется.':'Можно оставить пустым — программа выберет карточки из каталога.';$('task-hint').textContent=$('task').value==='telegram'?'Проверим каналы, охваты и возможность размещения рекламы.':$('task').value==='advertisers'?'Соберём кандидатов. Без подтверждённых фактов бренд останется на проверке.':'Проверим профили стримеров. Неподтверждённые показатели останутся пустыми.';}
+let latestReport=null;
+function candidateLink(value){try{const url=new URL(value);if(!['https:','http:'].includes(url.protocol)||url.username||url.password)return null;return url.href;}catch{return null;}}
+$('download-report').onclick=()=>{if(!latestReport)return;const blob=new Blob([JSON.stringify(latestReport,null,2)],{type:'application/json;charset=utf-8'});const url=URL.createObjectURL(blob);const link=document.createElement('a');link.href=url;link.download='agent-report.json';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);};
+const groups={telegram:['telegram-public','tgstat-web'],advertisers:['wb-web','ozon-web','instagram-web','youtube-web'],streamers:['twitch-web','kick-web']};
+function updateSource(){const source=$('source').value;const publicSource=source==='telegram-public';$('public-query').hidden=!publicSource;$('write').disabled=publicSource;if(publicSource)$('write').checked=false;$('login').disabled=publicSource;$('login-hint').textContent=publicSource?'Этот источник работает без аккаунта. Найденные каналы требуют проверки страны и охвата.':'Войдите на сайте в отдельном браузере и закройте его окно. Сессия сохранится.';$('tg').hidden=source!=='tgstat-web';const direct=['instagram-web','youtube-web'].includes(source);$('seed').required=direct;if(direct)$('seed').closest('details').open=true;$('seed-hint').textContent=direct?'Для этой платформы нужны прямые ссылки на профили. Самостоятельный поиск ещё не реализован.':['tgstat-web','telegram-public'].includes(source)?'Конкретные каналы имеют приоритет над поисковой фразой и тематикой.':'Можно оставить пустым — программа выберет карточки из каталога.';$('task-hint').textContent=$('task').value==='telegram'?(publicSource?'Найдём кандидатов. Страна, средний охват и возможность рекламы пока не подтверждены.':'Проверим каналы, охваты и возможность размещения рекламы.'):$('task').value==='advertisers'?'Соберём кандидатов. Без подтверждённых фактов бренд останется на проверке.':'Проверим профили стримеров. Неподтверждённые показатели останутся пустыми.';}
 $('task').onchange=()=>{const allowed=groups[$('task').value];for(const option of $('source').options){option.hidden=!allowed.includes(option.value);option.disabled=option.hidden;}$('source').value=allowed[0];$('seed').value='';updateSource();};
 $('topic').onchange=()=>{$('category').hidden=!!$('topic').value;};
 $('source').onchange=updateSource;
 $('task').onchange();
 async function api(path,data){const r=await fetch(path,{method:data?'POST':'GET',headers:{'Content-Type':'application/json','X-Control-Token':token},body:data?JSON.stringify(data):undefined});const value=await r.json();if(!r.ok)throw Error(value.error||'Ошибка запроса');return value;}
-function options(){return {source:$('source').value,seed:$('seed').value,category:$('seed').value.trim()?'':($('topic').value||$('category').value),countries:['ru','by'].filter(x=>$(x).checked),limit:Number($('limit').value),write:$('write').checked};}
+function options(){return {source:$('source').value,seed:$('seed').value,category:$('seed').value.trim()?'':($('topic').value||$('category').value),query:$('query').value,countries:['ru','by'].filter(x=>$(x).checked),limit:Number($('limit').value),write:$('write').checked};}
 $('form').onsubmit=e=>e.preventDefault();
 $('start').onclick=async e=>{e.preventDefault();if(!$('form').reportValidity())return;$('notice').textContent='';try{await api('/api/start',options());await refresh();}catch(e){$('notice').textContent=e.message;}};
 $('schedule').onclick=async()=>{try{await api('/api/jobs/add',{options:options(),interval_seconds:Number($('interval').value)*60});$('notice').textContent='Задание сохранено. Первый запуск начнётся автоматически.';await refreshJobs();}catch(e){$('notice').textContent=e.message;}};
@@ -481,7 +517,7 @@ async function refreshJobs(){try{const value=await api('/api/jobs');$('scheduler
 
 $('login').onclick=async()=>{try{await api('/api/session',{source:$('source').value});$('notice').textContent='Войдите в открытом браузере и закройте его окно. Пароли и коды вводите только на сайте.';await refresh();}catch(e){$('notice').textContent=e.message;}};
 $('stop').onclick=async()=>{try{await api('/api/stop',{});await refresh();}catch(e){$('notice').textContent=e.message;}};
-async function refresh(){try{const s=await api('/api/status');const names={idle:'Готов к запуску',running:'Идёт сбор',stopping:'Остановка',completed:'Завершён',attention:'Нужна проверка',cancelled:'Остановлен'};$('status').textContent=s.status==='running'&&s.operation==='login'?'Ожидаем входа в браузере':names[s.status]||s.status;const busy=['running','stopping'].includes(s.status);$('start').disabled=busy;$('login').disabled=busy;$('task').disabled=busy;$('source').disabled=busy;$('stop').disabled=!busy;$('problem').hidden=!s.problem;if(s.problem){$('notice').textContent='';$('problem-title').textContent=s.problem.title;$('problem-text').textContent=s.problem.message;}const r=s.report||{};if(r.session_status==='saved_unverified')$('notice').textContent=r.message;const counts=r.source_summary||{};for(const [id,key] of [['accepted','accept'],['review','review'],['rejected','reject']])$(id).textContent=counts[key]??'—';$('report').textContent=s.report?JSON.stringify(s.report,null,2):'Нет отчёта';$('error').textContent=s.error||'Нет сообщений';if(s.status==='completed'&&s.report&&!s.report.session_setup){$('notice').textContent='Поиск завершён. '+(s.write?'Разрешённые данные сохранены.':'Режим просмотра: таблицы не изменены.');}const err=(s.error||'')+JSON.stringify(r.source_error||{});if(err.includes('auth_required'))$('notice').textContent='Нужен вход в рабочий аккаунт. Задание не ждёт ввода; восстановите сессию отдельно.';const list=$('results');list.replaceChildren();if(s.report){for(const d of (r.decisions||[])){const row=document.createElement('div');row.className='item';const c=d.candidate||{};const title=document.createElement('strong');title.textContent=c['Название компании']||c['Название']||c['Стример']||d.product_observation?.title||'Кандидат без подтверждённого имени';const info=document.createElement('small');info.textContent=({accept:'Принят',review:'Требует проверки',reject:'Отклонён'}[d.decision]||d.decision)+' · '+((d.reasons||[]).join(' / ')||'Проверки пройдены');row.append(title,info);list.append(row);}if(!(r.decisions||[]).length)list.textContent='Нет принятых или рассмотренных кандидатов.';}}catch(e){$('status').textContent='Панель недоступна';}}
+async function refresh(){try{const s=await api('/api/status');const names={idle:'Готов к запуску',running:'Идёт сбор',stopping:'Остановка',completed:'Завершён',attention:'Нужна проверка',cancelled:'Остановлен'};$('status').textContent=s.status==='running'&&s.operation==='login'?'Ожидаем входа в браузере':names[s.status]||s.status;const busy=['running','stopping'].includes(s.status);$('start').disabled=busy;$('login').disabled=busy||$('source').value==='telegram-public';$('task').disabled=busy;$('source').disabled=busy;$('stop').disabled=!busy;$('problem').hidden=!s.problem;if(s.problem){$('notice').textContent='';$('problem-title').textContent=s.problem.title;$('problem-text').textContent=s.problem.message;}const r=s.report||{};latestReport=s.report||null;$('download-report').disabled=!latestReport;if(r.session_status==='saved_unverified')$('notice').textContent=r.message;const counts=r.source_summary||{};for(const [id,key] of [['accepted','accept'],['review','review'],['rejected','reject']])$(id).textContent=counts[key]??'—';$('report').textContent=s.report?JSON.stringify(s.report,null,2):'Нет отчёта';$('error').textContent=s.error||'Нет сообщений';if(s.status==='completed'&&s.report&&!s.report.session_setup){$('notice').textContent='Поиск завершён. '+(s.write?'Разрешённые данные сохранены.':'Режим просмотра: таблицы не изменены.');}const err=(s.error||'')+JSON.stringify(r.source_error||{});if(err.includes('auth_required'))$('notice').textContent='Нужен вход в рабочий аккаунт. Задание не ждёт ввода; восстановите сессию отдельно.';const list=$('results');list.replaceChildren();if(s.report){for(const d of (r.decisions||[])){const row=document.createElement('div');row.className='item';const c=d.candidate||{};const title=document.createElement('strong');title.textContent=c['Название компании']||c['Название']||c['Стример']||d.product_observation?.title||'Кандидат без подтверждённого имени';const info=document.createElement('small');info.textContent=({accept:'Принят',review:'Требует проверки',reject:'Отклонён'}[d.decision]||d.decision)+' · '+((d.reasons||[]).join(' / ')||'Проверки пройдены');row.append(title,info);const facts=document.createElement('small');facts.textContent=[c['Ссылка'],c['Подписчики']!==undefined?c['Подписчики'].toLocaleString()+' подписчиков':'',(d.contact_suggestions||[]).length?'Контакты для проверки: '+d.contact_suggestions.join(', '):''].filter(Boolean).join(' · ');row.append(facts);const href=candidateLink(c['Ссылка']||c['Сайт']||d.evidence?.url);if(href){const link=document.createElement('a');link.href=href;link.target='_blank';link.rel='noopener noreferrer';link.textContent='Открыть источник';link.style.color='#79e0ba';row.append(link);}list.append(row);}if(!(r.decisions||[]).length)list.textContent='Нет принятых или рассмотренных кандидатов.';}}catch(e){$('status').textContent='Панель недоступна';}}
 refresh();refreshJobs();setInterval(refresh,2000);setInterval(refreshJobs,5000);
 </script></html>'''
 

@@ -92,7 +92,7 @@ def run_source(source_name, *, writer=None, dry_run=True, payload=None,
     from wb_parser import WBSource, SourceError, country_code, enrich_website
     from tg_parser import TGStatSource
 
-    if unattended and (not source_name.endswith("-web") or payload is not None or interactive_login):
+    if unattended and ((not source_name.endswith("-web") and source_name != "telegram-public") or payload is not None or interactive_login):
         raise ValidationError("Автономный режим требует живой браузерный источник без ручного входа.")
     if not countries or set(countries) - {"ru", "by"}:
         raise ValidationError("Разрешены только страны ru и by.")
@@ -120,6 +120,12 @@ def run_source(source_name, *, writer=None, dry_run=True, payload=None,
                         if decision["decision"] == "accept":
                             decision["decision"] = "review"
                             decision["reasons"].append("Живая проверка сайта не выполнена.")
+    elif source_name == "telegram-public":
+        from tg_parser import TelegramPublicSource
+        if not dry_run or payload is not None or proofs or category or tg_filters or enrich_sites or urls or keep_session or interactive_login or discover or niche or allow_unofficial:
+            raise ValidationError('Публичный поиск работает только в dry-run и принимает query/channels, countries и limit.')
+        decisions = TelegramPublicSource().collect(query=query, channels=channels, countries=countries, limit=limit)
+        table = "telegram"
     elif source_name == "tgstat":
         decisions = TGStatSource().collect(payload=payload, query=query, limit=limit,
                                             countries=countries, category=category, **(tg_filters or {}))
@@ -189,7 +195,7 @@ def main(argv=None):
     source.add_argument("--dashboard", action="store_true", help="Открыть локальную панель управления")
     source.add_argument("--demo", action="store_true", help="Пример без записи")
     source.add_argument("--input", type=Path, help="JSON-массив кандидатов одной таблицы")
-    source.add_argument("--source", choices=("wb", "tgstat", "tgstat-web", "wb-web", "ozon-web", "instagram-web", "youtube-web", "twitch-web", "kick-web"), help="Источник MVP с фильтром качества")
+    source.add_argument("--source", choices=("wb", "tgstat", "telegram-public", "tgstat-web", "wb-web", "ozon-web", "instagram-web", "youtube-web", "twitch-web", "kick-web"), help="Источник MVP с фильтром качества")
     parser.add_argument("--wb-file", type=Path, help="Сохранённый JSON-каталог WB")
     parser.add_argument("--tg-file", type=Path, help="Разрешённая выгрузка TGStat: info/stat")
     parser.add_argument("--web-file", type=Path, help="Сохранённые видимые снимки TGStat: captures")
@@ -198,7 +204,7 @@ def main(argv=None):
     parser.add_argument("--discover", action="store_true", help="Найти карточки в публичном каталоге WB/Ozon/Twitch/Kick")
     parser.add_argument("--interactive-login", action="store_true", help="Разрешить паузу только при необходимом входе (новые браузерные источники)")
     parser.add_argument("--urls", nargs="+", help="Прямые ссылки для браузерных источников кроме TGStat")
-    parser.add_argument("--channels", nargs="+", help="Браузер TGStat: @username или прямая карточка")
+    parser.add_argument("--channels", nargs="+", help="TGStat: карточка/@username; публичный поиск: @username или ссылка t.me")
     parser.add_argument("--brand-proofs", type=Path, help="Проверенные факты по брендам")
     parser.add_argument("--query", help="Ключевое слово поиска; ниша бренда из него не выводится")
     parser.add_argument("--niche", help="Необязательный фильтр подтверждённой ниши WB")
@@ -234,7 +240,7 @@ def main(argv=None):
     if args.dashboard:
         from control_panel import main as dashboard_main
         return dashboard_main()
-    limit = args.limit if args.limit is not None else (5 if args.source and args.source.endswith("-web") else 50)
+    limit = args.limit if args.limit is not None else (5 if args.source and (args.source.endswith("-web") or args.source == "telegram-public") else 50)
     if args.demo and (args.write or args.table != "telegram"):
         parser.error("Демонстрация разрешена только для Telegram без --write.")
     tg_filters = {name: getattr(args, name) for name in
@@ -248,9 +254,9 @@ def main(argv=None):
     generic_browser = browser_source and args.source != "tgstat-web"
     if args.web_file and not browser_source:
         parser.error("--web-file требует браузерный источник.")
-    if args.channels and args.source != "tgstat-web":
-        parser.error("--channels требует --source tgstat-web.")
-    if args.unattended and (not browser_source or args.web_file or args.interactive_login):
+    if args.channels and args.source not in {"tgstat-web", "telegram-public"}:
+        parser.error("--channels требует tgstat-web либо telegram-public.")
+    if args.unattended and ((not browser_source and args.source != "telegram-public") or args.web_file or args.interactive_login):
         parser.error("--unattended требует живой браузерный источник и несовместим с --interactive-login.")
     if args.keep_session and (not browser_source or args.web_file):
         parser.error("--keep-session требует живой браузерный источник.")

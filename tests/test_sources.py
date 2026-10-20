@@ -1159,3 +1159,143 @@ class SessionWindowCloseTests(unittest.TestCase):
             result = setup_browser_session('tgstat')
         context.close.assert_called_once()
         self.assertEqual(result['session_status'], 'saved_unverified')
+
+
+class TelegramPublicTests(unittest.TestCase):
+    @staticmethod
+    def page(username='example_channel', subscribers='2 000', kind='subscribers', description='Реклама: @public_manager'):
+        from html import escape
+        return ('<meta property="og:title" content="Проверяемый канал">'
+                '<meta property="og:description" content="'+escape(description, quote=True)+'">'
+                '<div class="tgme_page_extra">'+subscribers+' '+kind+'</div>'
+                '<a class="tgme_action_button_new" href="tg://resolve?domain='+username+'">View</a>')
+
+    class HTTP:
+        def __init__(self, page, records=None):
+            self.page, self.records, self.calls = page, records, []
+        def get(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            return {'data': self.records} if '/api/v1/' in url else self.page
+
+    def test_direct_channel_reads_public_exact_count_but_never_auto_accepts(self):
+        from tg_parser import TelegramPublicSource
+        http = self.HTTP(self.page())
+        result = TelegramPublicSource(http).collect(channels=['@example_channel'], countries=['ru'], limit=1)[0]
+        self.assertEqual(result['candidate']['Подписчики'], 2000)
+        self.assertEqual(result['decision'], 'review')
+        self.assertIsNone(result['evidence']['country'])
+        self.assertEqual(result['contact_suggestions'], ['@public_manager'])
+        for field in ('Средний охват', 'ERR (%)', 'Контакт', 'Стоимость 1/24'):
+            self.assertNotIn(field, result['candidate'])
+        self.assertEqual(len(http.calls), 1)
+
+    def test_discovery_ignores_estimated_metrics_and_unverified_geo(self):
+        from tg_parser import TelegramPublicSource
+        http = self.HTTP(self.page(), [{'username':'example_channel','avgViews':160,'country':'ru','members':999999,'estimatedCpm':5}])
+        result = TelegramPublicSource(http).collect(query='Беларусь', countries=['by'], limit=1)[0]
+        self.assertEqual(result['candidate']['Подписчики'], 2000)
+        self.assertEqual(result['decision'], 'review')
+        self.assertNotIn('Средний охват', result['candidate'])
+        self.assertIsNone(result['evidence']['country'])
+        self.assertEqual(http.calls[0][1]['params']['q'], 'Беларусь')
+
+    def test_country_words_are_search_terms_not_country_evidence(self):
+        from tg_parser import TelegramPublicSource
+        class HTTP(self.HTTP):
+            def get(self, url, **kwargs):
+                if '/api/v1/' in url:
+                    self.calls.append((url, kwargs))
+                    return {'data': []}
+                return super().get(url, **kwargs)
+        http = HTTP(self.page())
+        self.assertEqual(TelegramPublicSource(http).collect(countries=['ru','by'], limit=2), [])
+        self.assertEqual([params['params']['q'] for _, params in http.calls], ['Россия', 'Беларусь'])
+
+    def test_rounded_counts_chats_and_wrong_identity_stay_out_of_candidate(self):
+        from tg_parser import TelegramPublicSource
+        for page in (self.page(subscribers='2K'), self.page(kind='members'), self.page(username='other_channel')):
+            with self.subTest(page=page):
+                result = TelegramPublicSource(self.HTTP(page)).collect(channels=['@example_channel'], limit=1)[0]
+                self.assertEqual(result['decision'], 'review')
+                self.assertEqual(result['candidate'], {})
+
+    def test_below_minimum_is_rejected(self):
+        from tg_parser import TelegramPublicSource
+        result = TelegramPublicSource(self.HTTP(self.page(subscribers='99'))).collect(channels=['@example_channel'], limit=1)[0]
+        self.assertEqual(result['decision'], 'reject')
+
+    def test_bad_parameters_fail_before_network(self):
+        from tg_parser import TelegramPublicSource
+        for kwargs in ({'query':'aa'}, {'limit':True}, {'countries':['us']}, {'channels':['https://evil.test/test']}, {'channels':['@example_channel'],'query':'test'}):
+            http = self.HTTP(self.page())
+            with self.subTest(kwargs=kwargs), self.assertRaises(SourceError):
+                TelegramPublicSource(http).collect(**kwargs)
+            self.assertEqual(http.calls, [])
+
+    def test_malformed_api_contract_fails_closed(self):
+        from tg_parser import TelegramPublicSource
+        with self.assertRaises(SourceError):
+            TelegramPublicSource(self.HTTP(self.page(), None)).collect(query='test', limit=1)
+
+    def test_source_denial_is_not_silently_retried_or_replaced(self):
+        from tg_parser import TelegramPublicSource
+        from unittest.mock import MagicMock
+        http = MagicMock()
+        http.get.side_effect = SourceError('HTTP 403')
+        with self.assertRaises(SourceError):
+            TelegramPublicSource(http).collect(query='test', limit=1)
+        self.assertEqual(http.get.call_count, 1)
+
+    def test_cli_write_is_rejected_before_source_call(self):
+        with contextlib.redirect_stderr(io.StringIO()), patch('tg_parser.TelegramPublicSource.collect') as collect, self.assertRaises(SystemExit):
+            main(['--source','telegram-public','--channels','@example_channel','--write'])
+        collect.assert_not_called()
+
+    def test_pipeline_is_unattended_preview_without_file_writes(self):
+        from tg_parser import TelegramPublicSource
+        records = TelegramPublicSource(self.HTTP(self.page())).collect(channels=['@example_channel'], limit=1)
+        with tempfile.TemporaryDirectory() as directory, patch('tg_parser.TelegramPublicSource.collect', return_value=records):
+            root = Path(directory)/'storage'
+            report = run_source('telegram-public', unattended=True, channels=['@example_channel'], dry_run=True, writer=SafeWriter(root))
+            self.assertEqual(report['source_summary']['review'], 1)
+            self.assertEqual(report['summary']['added'], 0)
+            self.assertFalse(root.exists())
+
+
+class PublicVisibleDescriptionTests(unittest.TestCase):
+    page = staticmethod(TelegramPublicTests.page)
+    HTTP = TelegramPublicTests.HTTP
+    def test_visible_advertising_line_keeps_contact_separate_from_editor(self):
+        from tg_parser import TelegramPublicSource
+        page = self.page(description='Описание\\tРеклама // @ad_manager\\tРедакция // @editor_manager')
+        page += '<div class="tgme_page_description">Описание<br/>Реклама // <a href="https://t.me/ad_manager">@ad_manager</a><br/>Редакция // @editor_manager</div>'
+        result = TelegramPublicSource(self.HTTP(page)).collect(channels=['@example_channel'], limit=1)[0]
+        self.assertEqual(result['contact_suggestions'], ['@ad_manager'])
+        self.assertEqual(result['placement']['status'], 'offered')
+        self.assertEqual(result['decision'], 'review')
+        self.assertNotIn('Контакт', result['candidate'])
+
+    def test_ambiguous_visible_descriptions_do_not_create_candidate(self):
+        from tg_parser import TelegramPublicSource
+        page = self.page() + '<div class="tgme_page_description">Реклама @first_manager</div><div class="tgme_page_description">Реклама @second_manager</div>'
+        result = TelegramPublicSource(self.HTTP(page)).collect(channels=['@example_channel'], limit=1)[0]
+        self.assertEqual(result['candidate'], {})
+        self.assertEqual(result['decision'], 'review')
+
+
+class BrowserFailureDiagnosticTests(unittest.TestCase):
+    def test_known_startup_failures_are_actionable_and_hide_raw_details(self):
+        from wb_parser import browser_failure_message
+        for raw,expected in (("Executable doesn't exist at /private/secret", 'Chromium не установлен'),
+                             ('MachPortRendezvousServer Permission denied private-token', 'Сайты ещё не проверены'),
+                             ('ProcessSingleton SingletonLock private-token', 'профиль занят')):
+            with self.subTest(raw=raw):
+                message = browser_failure_message(RuntimeError(raw))
+                self.assertIn(expected, message)
+                self.assertNotIn('private-token', message)
+                self.assertNotIn('/private/secret', message)
+
+    def test_unknown_error_never_discloses_browser_log(self):
+        from wb_parser import browser_failure_message
+        message = browser_failure_message(RuntimeError('https://user:secret@example.test'))
+        self.assertEqual(message, 'Браузерный сбор прерван. Запись пакета запрещена.')

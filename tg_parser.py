@@ -560,7 +560,8 @@ class TGStatWebSource(Source):
                     elif context is not None:
                         context.close()
         except BrowserError as error:
-            raise SourceError("Браузер не смог прочитать страницу. Если Chromium не установлен: PLAYWRIGHT_BROWSERS_PATH=cache/ms-playwright python -m playwright install chromium. Подробности запуска: README.md.") from error
+            from wb_parser import browser_failure_message
+            raise SourceError(browser_failure_message(error)) from error
         except (EOFError, KeyboardInterrupt) as error:
             raise SourceError("Вход или сбор остановлен оператором. Рабочие таблицы не изменены.") from error
 
@@ -606,3 +607,147 @@ class TGStatWebSource(Source):
         body = page.locator("body").inner_text(timeout=15000)
         if re.search(r"just a moment|verify you are human|подтвердите,? что вы человек|проверка браузера|captcha", page.title() + "\n" + body, re.I):
             raise SourceError("На странице проверка доступа. Автоматический обход отключён.")
+
+
+class _PublicTelegramPreview:
+    """Извлекает только публичную шапку, без постов и скрытых данных."""
+    @staticmethod
+    def parse(html, username):
+        from html.parser import HTMLParser
+        from urllib.parse import urlsplit, parse_qs
+        class HeaderParser(HTMLParser):
+            def __init__(self):
+                super().__init__(convert_charrefs=True)
+                self.meta = {}
+                self.domains = set()
+                self.depth = 0
+                self.capture = None
+                self.extra = []
+                self.description_depth = None
+                self.descriptions = []
+            def handle_starttag(self, tag, attrs):
+                attrs = dict(attrs)
+                classes = attrs.get('class', '').split()
+                if tag == 'meta' and attrs.get('property') in ('og:title', 'og:description'):
+                    self.meta.setdefault(attrs['property'], set()).add(attrs.get('content', ''))
+                if tag == 'div':
+                    self.depth += 1
+                    if 'tgme_page_extra' in classes:
+                        self.capture = self.depth
+                    if 'tgme_page_description' in classes:
+                        self.description_depth = self.depth
+                        self.descriptions.append([])
+                if tag == 'br' and self.description_depth is not None:
+                    self.descriptions[-1].append('\n')
+                if tag == 'a' and 'tgme_action_button_new' in classes:
+                    target = urlsplit(attrs.get('href', ''))
+                    if target.scheme == 'tg' and target.netloc == 'resolve':
+                        self.domains.update(value.lower() for value in parse_qs(target.query).get('domain', []))
+            def handle_endtag(self, tag):
+                if tag == 'div':
+                    if self.capture == self.depth:
+                        self.capture = None
+                    if self.description_depth == self.depth:
+                        self.description_depth = None
+                    self.depth -= 1
+            def handle_data(self, data):
+                if self.capture is not None:
+                    self.extra.append(data)
+                if self.description_depth is not None:
+                    self.descriptions[-1].append(data)
+        parser = HeaderParser()
+        parser.feed(html)
+        if parser.domains != {username}:
+            raise ValidationError('Публичная страница не подтверждает username запрошенного канала.')
+        extra = ' '.join(''.join(parser.extra).split())
+        match = re.fullmatch(r'([0-9][0-9\s]*) subscribers', extra)
+        if not match:
+            raise ValidationError('Нет точного числа подписчиков публичного канала; группы и сокращения не принимаются.')
+        titles = parser.meta.get('og:title', set())
+        descriptions = parser.meta.get('og:description', set())
+        if len(titles) != 1 or not next(iter(titles)).strip() or len(descriptions) > 1:
+            raise ValidationError('Неоднозначный заголовок публичного канала.')
+        if len(parser.descriptions) > 1:
+            raise ValidationError('Неоднозначное видимое описание публичного канала.')
+        description = ''.join(parser.descriptions[0]) if parser.descriptions else next(iter(descriptions), '')
+        return next(iter(titles)).strip(), int(match[1].replace(' ', '')), description
+
+
+class TelegramPublicSource(Source):
+    """Бесплатное обнаружение + проверка публичной шапки Telegram.
+
+    Результаты только review/reject: география и средний охват не угадываются.
+    avgViews API не переносится в таблицу: документация описывает медиану.
+    """
+    API_URL = 'https://tgadsspy.com/api/v1/channels'
+
+    @staticmethod
+    def username(value):
+        key = telegram_key(value)
+        if key is None:
+            raise SourceError('Нужен @username или прямая публичная ссылка Telegram.')
+        return key[1]
+
+    def __init__(self, http=None):
+        self.http = http
+
+    def collect(self, *, query=None, channels=None, countries=('ru', 'by'), limit=5):
+        if type(limit) is not int or not 1 <= limit <= 10:
+            raise SourceError('Лимит публичного поиска: от 1 до 10 каналов.')
+        if not countries or set(countries) - {'ru', 'by'}:
+            raise SourceError('Разрешены только ru и by.')
+        if query is not None and (not isinstance(query, str) or not 3 <= len(query.strip()) <= 200):
+            raise SourceError('Поисковая фраза: от 3 до 200 символов.')
+        if channels is not None and (not isinstance(channels, list) or not channels or query):
+            raise SourceError('Выберите поисковую фразу либо список каналов.')
+        usernames = list(dict.fromkeys(self.username(value) for value in (channels or [])))[:limit]
+        http = self.http or SourceHTTP()
+        decisions = []
+        try:
+            if not usernames:
+                queries = [query.strip()] if query else [{'ru': 'Россия', 'by': 'Беларусь'}[country] for country in dict.fromkeys(countries)]
+                for index, phrase in enumerate(queries):
+                    quota = math.ceil((limit-len(usernames))/(len(queries)-index))
+                    if quota <= 0:
+                        break
+                    response = http.get(self.API_URL, params={'q': phrase, 'limit': quota, 'minMembers': config.TG_MIN_SUBSCRIBERS})
+                    records = response.get('data') if isinstance(response, dict) else None
+                    if not isinstance(records, list):
+                        raise SourceError('Публичный каталог вернул неизвестную схему.')
+                    for record in records[:quota]:
+                        if not isinstance(record, dict) or not isinstance(record.get('username'), str):
+                            raise SourceError('В каталоге отсутствует username.')
+                        name = self.username('@' + record['username'])
+                        if name not in usernames:
+                            usernames.append(name)
+            for name in usernames[:limit]:
+                url = 'https://t.me/' + name
+                html = http.get(url, json_response=False)
+                result = {'source': 'telegram-public', 'mode': 'public-http', 'decision': 'review',
+                          'candidate': {}, 'score': None, 'reasons': []}
+                try:
+                    title, subscribers, description = _PublicTelegramPreview.parse(html, name)
+                    observed = datetime.now(timezone.utc).isoformat()
+                    result['candidate'] = {'Название': title, 'Ссылка': url, 'Подписчики': subscribers,
+                                           'Последнее обновление': observed}
+                    result['observed_at'] = observed
+                    result['evidence'] = {'url': url, 'subscribers': subscribers, 'country': None,
+                                          'requested_countries': list(countries),
+                                          'discovery_url': self.API_URL if not channels else None,
+                                          'metrics_ignored': ['avgViews', 'estimatedCpm']}
+                    result['reasons'] = ['Страна канала не подтверждена; язык и поисковая фраза не доказывают РФ/Беларусь.',
+                                         'Нет проверенного среднего охвата. ERR и цены оставлены пустыми.']
+                    _check_placement(result, description)
+                    result['contact_suggestions'] = result['placement']['contacts']
+                    if result['placement']['status'] != 'offered':
+                        result['reasons'].append('Нет подтверждённого предложения рекламы с публичным контактом.')
+                    if subscribers < config.TG_MIN_SUBSCRIBERS:
+                        result['decision'] = 'reject'
+                        result['reasons'].append('Подписчиков меньше минимального порога.')
+                except ValidationError as error:
+                    result['reasons'].append(str(error))
+                decisions.append(result)
+            return decisions
+        finally:
+            if self.http is None:
+                http.close()

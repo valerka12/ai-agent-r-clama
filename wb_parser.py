@@ -418,6 +418,19 @@ class BrowserBatchError(SourceError):
         self.decisions = decisions
 
 
+
+def browser_failure_message(error):
+    """Классификация сбоя без вывода сырых логов браузера и секретов."""
+    text = str(error).lower()
+    if 'executable doesn' in text and 'exist' in text:
+        return 'browser_unavailable: Chromium не установлен или не найден. Переустановите полную сборку с папкой browser_engine; для запуска из исходников установите браузер по README.'
+    if 'machportrendezvous' in text and 'permission denied' in text:
+        return 'browser_unavailable: среда запуска запретила системный процесс Chromium. Запустите приложение напрямую в обычном сеансе macOS. Сайты ещё не проверены; повторный вход это не исправляет.'
+    if 'singletonlock' in text or 'processsingleton' in text:
+        return 'browser_unavailable: рабочий профиль занят другим процессом. Закройте окно входа или второй экземпляр приложения и повторите запуск. Файлы профиля не удаляйте.'
+    return 'Браузерный сбор прерван. Запись пакета запрещена.'
+
+
 def browser_profile_dir(platform):
     """Только выделенные профили проекта; личные профили браузеров не используются."""
     allowed = {'wb', 'ozon', 'instagram', 'youtube', 'twitch', 'kick', 'tgstat'}
@@ -621,7 +634,7 @@ class VisibleBrowserSource(Source):
                     elif context is not None:
                         context.close()
         except (BrowserError, EOFError, KeyboardInterrupt) as error:
-            raise SourceError("Браузерный сбор прерван. Запись пакета запрещена.") from error
+            raise SourceError(browser_failure_message(error)) from error
 
     def _discover_urls(self, page):
         from urllib.parse import urljoin
