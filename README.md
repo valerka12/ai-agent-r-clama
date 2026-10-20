@@ -1056,3 +1056,11 @@ outputs/mac-release-check.json и outputs/public-contact-check.json.
 файла тестов и документация. Структура проекта, config.py, зависимости,
 safe_writer.py и рабочие таблицы не менялись. Полная автономность всех платформ,
 подтверждение страны/охвата и автоматическое восстановление входа не завершены.
+
+Состояние поставки от 20 октября 2026: исходники сохранены в ветке
+`desktop/windows-macos`, коммит e26d5be9e615e6026f493e24860232c64d3e630d.
+Новая сборка Windows успешно прошла тесты, упаковку и запуск процесса:
+https://github.com/valerka12/ai-agent-r-clama/actions/runs/39489128802
+Архив Mac: outputs/Agent-macOS-AppleSilicon-Latest.zip, целостность проверена;
+в нём нет учётных данных, профилей и рабочих таблиц. Инструкции:
+outputs/DESKTOP_GUIDE.md и outputs/WINDOWS_DOWNLOAD.md.
