@@ -489,7 +489,7 @@ class TelegramOperatorReviewTests(unittest.TestCase):
         self.assertTrue(result['saved'])
         self.assertEqual(self.writer.read('telegram')[0]['Контакт'], '@ad_manager')
         self.assertTrue(list((self.root/'backups').rglob('telegram.csv')))
-        self.assertIn('committed', (self.root/'logs/changes_log.csv').read_text())
+        self.assertIn('committed', (self.root/'logs/changes_log.csv').read_text(encoding='utf-8-sig'))
         self.assertEqual(len(self.controller.state['report']['manual_reviews']), 1)
         with self.assertRaises(ValueError):
             self.commit('bad-token')
