@@ -1095,3 +1095,11 @@ outputs/DESKTOP_GUIDE.md и outputs/WINDOWS_DOWNLOAD.md.
 Изменены control_panel.py, tests/test_control_panel.py и README.md. SafeWriter,
 config.py, зависимости и схемы таблиц не менялись. Этот этап является ручным
 контролем качества; автоматическое подтверждение географии/охвата не завершено.
+
+Форма проверки включена в обновлённый Mac-архив
+outputs/Agent-macOS-AppleSilicon-Latest.zip. Windows-проверка этой версии:
+https://github.com/valerka12/ai-agent-r-clama/actions/runs/39492353645
+Тесты, сборка и запуск упакованного процесса Windows прошли. Исправление теста:
+чтение журнала явно в UTF-8, независимо от системной кодировки ОС.
+Вручную новая форма в графическом окне ещё не проверена; проверены её
+JavaScript-обработчики и реальный локальный HTTP-сценарий на временном хранилище.
