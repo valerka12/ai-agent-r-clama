@@ -172,6 +172,9 @@ def assess_brand(product, proofs, *, niche=None, now=None, marketplace_metrics=T
         rating, reviews = product.get("reviewRating"), product.get("feedbacks")
         if isinstance(rating, bool) or not isinstance(rating, (int, float)) or not math.isfinite(rating):
             result["reasons"].append("Нет подтверждённого рейтинга товара.")
+        elif not 0 <= rating <= 5:
+            result["decision"] = "reject"
+            result["reasons"].append("Рейтинг товара вне допустимого диапазона 0–5.")
         elif rating < config.WB_MIN_RATING:
             result["decision"] = "reject"
             result["reasons"].append("Рейтинг товара ниже порога.")
@@ -681,6 +684,42 @@ class VisibleBrowserSource(Source):
             raise SourceError("В область профиля попал чат; сбор остановлен до уточнения селектора.")
         return capture
 
+    def _marketplace_brand(self, capture):
+        """Только явная видимая ссылка бренда; продавец/заголовок не подставляются."""
+        import re
+        links = capture.get('brand_links', [])
+        if self.platform not in {'WB', 'Ozon'} or not isinstance(links, list) or not links:
+            return None
+        brands = set()
+        for link in links:
+            if not isinstance(link, dict) or link.get('visible') is not True:
+                return None
+            name, url = link.get('name'), link.get('url')
+            if not isinstance(name, str) or not isinstance(url, str):
+                return None
+            name = ' '.join(name.split())
+            if (not 2 <= len(name) <= 150 or not any(char.isalpha() for char in name)
+                    or name.casefold() in {'без бренда', 'нет бренда', 'no brand', 'noname',
+                                           'бренд', 'магазин', 'перейти в магазин', 'brand',
+                                           'официальный магазин', 'все товары бренда', 'товары бренда',
+                                           'логотип бренда', 'логотип', 'logo'}):
+                return None
+            try:
+                validate_url(url)
+                parsed = urlsplit(url)
+                path = r'/brands/[^/]+/?' if self.platform == 'WB' else r'/brand/[^/]+/?'
+                if (parsed.scheme != 'https' or parsed.hostname not in self.hosts
+                        or parsed.port is not None or parsed.query or parsed.fragment
+                        or not re.fullmatch(path, parsed.path)):
+                    return None
+            except (ValueError, ValidationError):
+                return None
+            brands.add((name, url.rstrip('/')))
+        if len(brands) != 1:
+            return None
+        name, url = brands.pop()
+        return {'name': name, 'url': url, 'operator_verified': False}
+
     def decide(self, capture, proofs, countries, niche):
         """Факты оператора связаны с конкретной страницей; текст не даёт прав записи."""
         from tg_parser import placement_evidence
@@ -740,7 +779,12 @@ class VisibleBrowserSource(Source):
             bound = (isinstance(brand_fact, dict) and brand_fact.get("url", "").rstrip("/") == url
                      and isinstance(brand, str) and brand.strip()
                      and brand.casefold() in text.casefold())
-            if not bound:
+            observed_brand = self._marketplace_brand(capture) if fresh else None
+            if observed_brand is not None and bound and observed_brand['name'].casefold() != brand.strip().casefold():
+                reasons.append('Видимый бренд противоречит проверенному факту brand.')
+            if observed_brand is not None and not bound:
+                brand = observed_brand['name']
+            if not bound and observed_brand is None:
                 reasons.append("Бренд не подтверждён на этой странице; нужен факт brand со ссылкой на неё.")
                 decision = {"candidate": {}, "decision": "review", "score": None, "reasons": []}
             else:
@@ -768,7 +812,8 @@ class VisibleBrowserSource(Source):
                         contact_suggestions=placement["contacts"])
         if self.platform in {"WB", "Ozon"}:
             decision["product_observation"] = {"title": capture.get("title"),
-                                                "metrics": capture.get("product_metrics", {})}
+                                                "metrics": capture.get("product_metrics", {}),
+                                                "brand": observed_brand}
         return decision
 
 
@@ -787,7 +832,10 @@ class WBWebSource(VisibleBrowserSource):
             const title = root.querySelector('[class*="productTitle--"]');
             const content = root.querySelector('[class*="productPageContent--"]');
             return {url:location.href, title:title?.innerText || '',
-                text:(content?.innerText || '').split('Характеристики и описание')[0].slice(0,10000)};
+                text:(content?.innerText || '').split('Характеристики и описание')[0].slice(0,10000),
+                brand_links:Array.from(root.querySelectorAll('a[class*="brand"][href*="/brands/"], [class*="brand"] a[href*="/brands/"]'))
+                    .filter(e=>e.getClientRects().length && getComputedStyle(e).visibility!=='hidden')
+                    .map(e=>({name:e.innerText.trim() || e.querySelector('img')?.alt || '',url:e.href,visible:true}))};
         }""")
         import re
         matches = re.findall(r'(?m)^([0-5][.,][0-9])\s*[·•]\s*([0-9][0-9\s]*)\s+оцен(?:ка|ки|ок)\s*$', capture['text'])

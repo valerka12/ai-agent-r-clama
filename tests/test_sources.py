@@ -1299,3 +1299,100 @@ class BrowserFailureDiagnosticTests(unittest.TestCase):
         from wb_parser import browser_failure_message
         message = browser_failure_message(RuntimeError('https://user:secret@example.test'))
         self.assertEqual(message, 'Браузерный сбор прерван. Запись пакета запрещена.')
+
+
+class AdvertiserBrandObservationTests(unittest.TestCase):
+    def capture(self, platform='WB'):
+        now = datetime.now(timezone.utc).isoformat()
+        if platform == 'WB':
+            url,brand_url = 'https://www.wildberries.ru/catalog/123/detail.aspx','https://www.wildberries.ru/brands/example'
+        else:
+            url,brand_url = 'https://www.ozon.ru/product/item-123','https://www.ozon.ru/brand/example-123'
+        return {'url':url,'title':'Проверяемый товар','text':'Example Brand\nПроверяемый товар\n4.9 • 1000 отзывов',
+                'observed_at':now,'product_metrics':{'reviewRating':4.9,'feedbacks':1000},
+                'brand_links':[{'name':'Example Brand','url':brand_url,'visible':True}]}
+
+    def sources(self):
+        from wb_parser import WBWebSource
+        from ozon_parser import OzonWebSource
+        return WBWebSource(), OzonWebSource()
+
+    def test_explicit_brand_is_a_candidate_without_invented_country_or_contacts(self):
+        for source in self.sources():
+            capture = self.capture(source.platform)
+            result = source.collect(payload={'captures':[capture]})[0]
+            self.assertEqual(result['candidate']['Название компании'],'Example Brand')
+            self.assertEqual(result['candidate']['Рекламируемый продукт'],'Проверяемый товар')
+            self.assertEqual(result['decision'],'review')
+            self.assertIs(result['product_observation']['brand']['operator_verified'],False)
+            for field in ('Страна','Сайт','Telegram/почта','Комментарий'):
+                self.assertNotIn(field,result['candidate'])
+
+    def test_product_title_or_seller_cannot_substitute_for_brand(self):
+        for source in self.sources():
+            capture = self.capture(source.platform)
+            capture.pop('brand_links')
+            capture['text'] = 'Продавец: Example Brand\nТовар Example Brand'
+            result = source.collect(payload={'captures':[capture]})[0]
+            self.assertEqual(result['candidate'],{})
+            self.assertEqual(result['decision'],'review')
+
+    def test_ambiguous_hidden_or_external_brand_link_is_not_used(self):
+        from copy import deepcopy
+        source = self.sources()[0]
+        capture = self.capture()
+        bad = []
+        for updates in ({'visible':False},{'url':'https://other.test/brands/example'},
+                        {'url':'https://www.wildberries.ru/seller/123'},
+                        {'url':'https://www.wildberries.ru/brands/example?token=x'},
+                        {'name':'Без бренда'}, {'name':''}):
+            item = deepcopy(capture)
+            item['brand_links'][0].update(updates)
+            bad.append(item)
+        item = deepcopy(capture)
+        item['brand_links'].append({'name':'Another','url':'https://www.wildberries.ru/brands/another','visible':True})
+        bad.append(item)
+        for item in bad:
+            with self.subTest(item=item['brand_links']):
+                result = source.collect(payload={'captures':[item]})[0]
+                self.assertEqual(result['candidate'],{})
+                self.assertNotEqual(result['decision'],'accept')
+
+    def test_stale_observation_does_not_produce_current_brand(self):
+        capture = self.capture()
+        capture['observed_at'] = '2020-01-01T00:00:00+00:00'
+        result = self.sources()[0].collect(payload={'captures':[capture]})[0]
+        self.assertEqual(result['candidate'],{})
+        self.assertIsNone(result['product_observation']['brand'])
+
+    def test_conflicting_verified_brand_remains_review(self):
+        capture = self.capture()
+        capture['text'] += '\nOther Brand'
+        now = datetime.now(timezone.utc)
+        fact = proof('Other Brand',now)
+        fact['url'] = capture['url']
+        result = self.sources()[0].collect(payload={'captures':[capture]},proofs={capture['url']:{'brand':fact}})[0]
+        self.assertNotEqual(result['decision'],'accept')
+        self.assertTrue(any('противоречит' in reason for reason in result['reasons']))
+
+    def test_invalid_rating_is_rejected_before_quality_acceptance(self):
+        product,proofs,now = self.verified_brand()
+        for rating in (5.1,6,100):
+            with self.subTest(rating=rating):
+                result = assess_brand(dict(product,reviewRating=rating),proofs,now=now)
+                self.assertEqual(result['decision'],'reject')
+
+    @staticmethod
+    def verified_brand():
+        now = datetime.now(timezone.utc)
+        return {'brand':'Example Brand','reviewRating':4.9,'feedbacks':1000},{'brand':proof('Example Brand',now)},now
+
+    def test_browser_import_preview_never_writes_provisional_advertisers(self):
+        from wb_parser import WBWebSource
+        capture = self.capture()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)/'storage'
+            report = run_source('wb-web',payload={'captures':[capture]},writer=SafeWriter(root),dry_run=True)
+            self.assertEqual(report['source_summary']['review'],1)
+            self.assertEqual(report['summary']['added'],0)
+            self.assertFalse(root.exists())

@@ -85,12 +85,18 @@ def demo_candidates():
 
 
 def run_source(source_name, *, writer=None, dry_run=True, payload=None,
-               proofs=None, query=None, limit=50, niche=None,
+               proofs=None, query=None, limit=None, niche=None,
                countries=("ru", "by"), category=None, allow_unofficial=False,
                tg_filters=None, enrich_sites=False, channels=None, urls=None, interactive_login=False, discover=False, keep_session=False, unattended=False):
     """Сначала решения источника, затем только принятые кандидаты -> ядро."""
     from wb_parser import WBSource, SourceError, country_code, enrich_website
     from tg_parser import TGStatSource
+
+    if not isinstance(source_name, str):
+        raise ValidationError("Неизвестный источник.")
+    if limit is None:
+        from config import MVP_LIMIT
+        limit = 5 if source_name.endswith("-web") or source_name == "telegram-public" else MVP_LIMIT
 
     if unattended and ((not source_name.endswith("-web") and source_name != "telegram-public") or payload is not None or interactive_login):
         raise ValidationError("Автономный режим требует живой браузерный источник без ручного входа.")
