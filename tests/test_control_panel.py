@@ -403,6 +403,15 @@ URL.revokeObjectURL=url=>{revoked=url;};global.setTimeout=fn=>fn();
 const originalCreate=document.createElement;document.createElement=tag=>tag==='a'?{click(){download={href:this.href,name:this.download};}}:originalCreate(tag);
 latestReport={source:'telegram-public',decisions:[]};document.getElementById('download-report').onclick();
 assert.deepEqual(download,{href:'blob:test',name:'agent-report.json'});assert.equal(revoked,'blob:test');
+const reviewRequests=[];global.fetch=async(path,opts)=>{reviewRequests.push([path,JSON.parse(opts.body)]);return {ok:true,json:async()=>path.endsWith('/preview')?{token:'review-token',plan:{action:'add'}}:{saved:true,result:{action:'add'}}};};
+openReview(0,{candidate:{'Название':'Канал'},contact_suggestions:['@ad_manager']});
+for(const [id,value] of Object.entries({'review-country':'ru','review-country-url':'https://example.org/geo','review-reach':'500','review-reach-url':'https://example.org/stat','review-placement-url':'https://t.me/example_channel','review-contact':'@ad_manager'}))document.getElementById(id).value=value;
+document.getElementById('review-verified').checked=true;
+await document.getElementById('review-preview').onclick();assert.equal(document.getElementById('review-save').disabled,false);
+assert.equal(reviewRequests[0][0],'/api/review/preview');assert.equal(reviewRequests[0][1].reach,500);
+document.getElementById('review-reach').oninput();assert.equal(document.getElementById('review-save').disabled,true);
+await document.getElementById('review-preview').onclick();await document.getElementById('review-save').onclick();
+assert.deepEqual(reviewRequests[2],['/api/review/commit',{token:'review-token'}]);assert.equal(document.getElementById('review-save').disabled,true);
 })().catch(e=>{console.error(e);process.exitCode=1});
 """
         result = subprocess.run([node, '-e', harness+script+verification], capture_output=True, text=True, timeout=10)
@@ -438,3 +447,164 @@ class BrowserProblemPanelTests(unittest.TestCase):
         self.assertEqual(problem['title'], 'Браузер не запустился')
         self.assertEqual(problem['message'], reason)
         self.assertNotIn('Войти в аккаунт', problem['message'])
+
+
+class TelegramOperatorReviewTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        from datetime import datetime, timezone
+        from safe_writer import SafeWriter
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)/'storage'
+        self.writer = SafeWriter(self.root)
+        self.controller = Controller()
+        self.candidate = {'Название':'Проверяемый канал','Ссылка':'https://t.me/example_channel',
+                          'Подписчики':2000,'Последнее обновление':datetime.now(timezone.utc).isoformat()}
+        self.controller.state = {'status':'completed','report':{'source':'telegram-public','decisions':[
+            {'decision':'review','candidate':self.candidate,'evidence':{'requested_countries':['ru']},
+             'placement':{'status':'offered'},'contact_suggestions':['@ad_manager']} ]}}
+        self.body = {'index':0,'candidate_url':self.candidate['Ссылка'],'observed_at':self.candidate['Последнее обновление'],'country':'ru','reach':500,'contact':'@ad_manager','verified':True,
+                     'country_url':'https://example.org/country', 'reach_url':'https://example.org/stat',
+                     'placement_url':'https://t.me/example_channel'}
+
+    def preview(self):
+        return self.controller.review_telegram(self.body, writer=self.writer)
+
+    def commit(self, token):
+        return self.controller.review_telegram({'token':token}, commit=True, writer=self.writer)
+
+    def test_preview_has_exact_changes_and_creates_no_files(self):
+        result = self.preview()
+        self.assertFalse(self.root.exists())
+        self.assertEqual(result['plan']['action'], 'add')
+        changes = {x['field']: x['after'] for x in result['plan']['changes']}
+        self.assertEqual(changes['Контакт'], '@ad_manager')
+        self.assertEqual(changes['ERR (%)'], '25.0')
+        self.assertNotIn('Страна', changes)
+
+    def test_commit_uses_safe_writer_backup_journal_and_one_use_token(self):
+        result = self.commit(self.preview()['token'])
+        self.assertTrue(result['saved'])
+        self.assertEqual(self.writer.read('telegram')[0]['Контакт'], '@ad_manager')
+        self.assertTrue(list((self.root/'backups').rglob('telegram.csv')))
+        self.assertIn('committed', (self.root/'logs/changes_log.csv').read_text())
+        self.assertEqual(len(self.controller.state['report']['manual_reviews']), 1)
+        with self.assertRaises(ValueError):
+            self.commit('bad-token')
+
+    def test_missing_confirmation_country_or_proof_does_not_write(self):
+        from validation import ValidationError
+        for changes in ({'verified':False},{'country':'by'},{'contact':'@editor'},
+                        {'country_url':'not a url'},{'reach':True},{'reach':0},{'reach':2001}):
+            with self.subTest(changes=changes):
+                body = dict(self.body, **changes)
+                with self.assertRaises((ValueError, ValidationError)):
+                    self.controller.review_telegram(body, writer=self.writer)
+                self.assertFalse(self.root.exists())
+
+    def test_new_search_invalidates_preview(self):
+        token = self.preview()['token']
+        self.controller.generation += 1
+        with self.assertRaises(ValueError):
+            self.commit(token)
+        self.assertFalse(self.root.exists())
+
+    def test_table_change_requires_new_preview_and_preserves_manual_values(self):
+        token = self.preview()['token']
+        self.writer.upsert('telegram',dict(self.candidate, Название='Ручное название'),dry_run=False)
+        original = (self.root/'data/telegram.csv').read_bytes()
+        with self.assertRaises(ValueError):
+            self.commit(token)
+        self.assertEqual((self.root/'data/telegram.csv').read_bytes(), original)
+        result = self.commit(self.preview()['token'])
+        self.assertTrue(result['saved'])
+        self.assertEqual(self.writer.read('telegram')[0]['Название'], 'Ручное название')
+
+    def test_stale_snapshot_or_rejected_candidate_cannot_be_promoted(self):
+        self.candidate['Последнее обновление'] = '2020-01-01T00:00:00+00:00'
+        with self.assertRaises(ValueError):
+            self.preview()
+        self.controller.state['report']['decisions'][0]['decision'] = 'reject'
+        with self.assertRaises(ValueError):
+            self.preview()
+        self.assertFalse(self.root.exists())
+
+    def test_storage_failure_consumes_token_and_does_not_claim_success(self):
+        from safe_writer import StorageError
+        token = self.preview()['token']
+        with patch.object(self.writer, 'log_report', side_effect=StorageError('audit failed')):
+            with self.assertRaises(StorageError):
+                self.commit(token)
+        self.assertFalse(self.root.exists())
+        with self.assertRaises(ValueError):
+            self.commit(token)
+
+    def test_conflicting_saved_metrics_are_not_mixed_with_new_observation(self):
+        self.writer.upsert('telegram',dict(self.candidate, Подписчики=3000),dry_run=False)
+        original = (self.root/'data/telegram.csv').read_bytes()
+        with self.assertRaises(ValueError):
+            self.preview()
+        self.assertEqual((self.root/'data/telegram.csv').read_bytes(), original)
+
+    def test_expired_preview_cannot_write(self):
+        token = self.preview()['token']
+        self.controller.review_preview['expires_at'] = 0
+        with self.assertRaises(ValueError):
+            self.commit(token)
+        self.assertFalse(self.root.exists())
+
+    def test_operator_comment_survives_review_commit(self):
+        import csv
+        self.writer.upsert('telegram',self.candidate,dry_run=False)
+        path = self.root/'data/telegram.csv'
+        with path.open(encoding='utf-8-sig',newline='') as stream:
+            reader = csv.DictReader(stream)
+            columns, rows = reader.fieldnames, list(reader)
+        rows[0]['Комментарий'] = 'Ручной комментарий: не менять'
+        with path.open('w',encoding='utf-8-sig',newline='') as stream:
+            writer = csv.DictWriter(stream,fieldnames=columns)
+            writer.writeheader();writer.writerows(rows)
+        self.commit(self.preview()['token'])
+        self.assertEqual(self.writer.read('telegram')[0]['Комментарий'], 'Ручной комментарий: не менять')
+
+    def test_old_form_cannot_approve_another_channel_at_same_index(self):
+        self.controller.state['report']['decisions'][0]['candidate']['Ссылка'] = 'https://t.me/another_channel'
+        with self.assertRaises(ValueError):
+            self.preview()
+        self.assertFalse(self.root.exists())
+
+    def test_http_preview_and_explicit_commit_with_local_token(self):
+        from pathlib import Path
+        import re
+        with patch('config.CACHE_DIR', Path(self.temp.name)/'panel-cache'), patch('safe_writer.SafeWriter', return_value=self.writer):
+            server = make_server(self.controller, port=0)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            def request(path, body=None, token=None):
+                connection = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=3)
+                headers = {'Content-Type':'application/json'}
+                if token is not None:
+                    headers['X-Control-Token'] = token
+                connection.request('POST' if body is not None else 'GET',path,
+                                   body=json.dumps(body) if body is not None else None,headers=headers)
+                response = connection.getresponse()
+                status,raw = response.status,response.read().decode()
+                connection.close()
+                return status,raw
+            try:
+                status,html = request('/')
+                self.assertEqual(status,200)
+                token = re.search(r'token="([A-Za-z0-9_-]+)"',html)[1]
+                self.assertEqual(request('/api/review/preview',self.body)[0],403)
+                status,raw = request('/api/review/preview',self.body,token)
+                self.assertEqual(status,200,raw)
+                preview = json.loads(raw)
+                self.assertFalse(self.root.exists())
+                status,raw = request('/api/review/commit',{'token':preview['token']},token)
+                self.assertEqual(status,200,raw)
+                self.assertTrue(json.loads(raw)['saved'])
+                self.assertEqual(self.writer.read('telegram')[0]['Контакт'],'@ad_manager')
+            finally:
+                server.shutdown();server.server_close();thread.join(3)

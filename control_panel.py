@@ -128,12 +128,96 @@ class Controller:
         self.lock = threading.Lock()
         self.process = None
         self.generation = 0
+        self.review_preview = None
         self.state = {'status': 'idle', 'report': None, 'error': '', 'exit_code': None}
 
     def snapshot(self):
         with self.lock:
             return dict(self.state, problem=explain_failure(self.state.get('error') or
                         (self.state.get('report') or {}).get('source_error', {}).get('reason')))
+
+    def review_telegram(self, body, *, commit=False, writer=None):
+        """Явная проверка оператором; автоматический источник остаётся read-only."""
+        from datetime import datetime, timezone
+        from safe_writer import SafeWriter
+        from validation import ValidationError, calculate_err, validate_url, validate_counter
+        if not isinstance(body, dict):
+            raise ValueError('Нужны данные проверки.')
+        storage = writer if writer is not None else SafeWriter()
+        with self.lock:
+            if self.state['status'] in ('running', 'stopping'):
+                raise ValueError('Дождитесь окончания поиска.')
+            report = self.state.get('report') or {}
+            if self.state.get('status') != 'completed' or report.get('source') != 'telegram-public' or report.get('source_error'):
+                raise ValueError('Проверка доступна только для завершённого публичного поиска Telegram.')
+            if commit:
+                pending = self.review_preview
+                token = body.get('token')
+                if (not pending or not isinstance(token, str)
+                        or not secrets.compare_digest(token, pending['token'])
+                        or pending['generation'] != self.generation
+                        or datetime.now(timezone.utc).timestamp() > pending['expires_at']):
+                    raise ValueError('План устарел. Выполните предварительную проверку заново.')
+                self.review_preview = None  # Не повторяем запись с неясным результатом.
+                candidate, proof = pending['candidate'], pending['proof']
+                current = storage.upsert('telegram', candidate, dry_run=True, confirmed_fields=('Контакт',))
+                if current != pending['plan']:
+                    raise ValueError('Таблица изменилась. Проверьте новый план перед сохранением.')
+                storage.log_report({'kind': 'operator_review', 'candidate': candidate, 'proof': proof})
+                result = storage.upsert('telegram', candidate, dry_run=False, confirmed_fields=('Контакт',))
+                report.setdefault('manual_reviews', []).append({'candidate': candidate, 'proof': proof, 'result': result})
+                return {'saved': True, 'result': result}
+            self.review_preview = None
+            index = body.get('index')
+            decisions = report.get('decisions', [])
+            if type(index) is not int or not 0 <= index < len(decisions):
+                raise ValueError('Выберите кандидата из текущего отчёта.')
+            decision = decisions[index]
+            if decision.get('decision') != 'review' or decision.get('placement', {}).get('status') != 'offered':
+                raise ValueError('Нет подтверждаемого предложения рекламы; требуется дальнейший сбор фактов.')
+            if body.get('verified') is not True:
+                raise ValueError('Подтвердите личную проверку фактов по указанным источникам.')
+            country = body.get('country')
+            if country not in ('ru', 'by') or country not in decision.get('evidence', {}).get('requested_countries', []):
+                raise ValueError('Страна должна соответствовать фильтру поиска: РФ или Беларусь.')
+            contact = body.get('contact')
+            if not isinstance(contact, str) or not contact or contact not in decision.get('contact_suggestions', []):
+                raise ValueError('Выберите рекламный контакт из предложения источника.')
+            candidate = {k: v for k, v in decision.get('candidate', {}).items()
+                         if k in ('Название', 'Ссылка', 'Подписчики', 'Последнее обновление', 'Тематика')}
+            if (body.get('candidate_url') != candidate.get('Ссылка')
+                    or body.get('observed_at') != candidate.get('Последнее обновление')):
+                raise ValueError('Карточка изменилась после поиска. Откройте проверку заново.')
+            if not candidate.get('Название') or not candidate.get('Ссылка'):
+                raise ValueError('Нет подтверждённого названия или ссылки.')
+            try:
+                observed = datetime.fromisoformat(candidate.get('Последнее обновление', ''))
+            except (ValueError, TypeError) as error:
+                raise ValueError('Нет корректной даты снимка. Повторите поиск.') from error
+            if observed.tzinfo is None or not 0 <= (datetime.now(timezone.utc)-observed).total_seconds() <= 86400:
+                raise ValueError('Снимок старше суток или имеет неверную дату. Повторите поиск.')
+            proof = {'country': country, 'operator_confirmed': True,
+                     'checked_at': datetime.now(timezone.utc).isoformat()}
+            for key in ('country_url', 'reach_url', 'placement_url'):
+                value = body.get(key)
+                validate_url(value)
+                proof[key] = value
+            reach = body.get('reach')
+            validate_counter(reach)
+            candidate['Средний охват'] = reach
+            candidate['ERR (%)'] = calculate_err(reach, candidate.get('Подписчики'))
+            if (candidate['Подписчики'] < config.TG_MIN_SUBSCRIBERS or reach < config.TG_MIN_REACH
+                    or not config.TG_MIN_ERR <= candidate['ERR (%)'] <= config.TG_MAX_ERR):
+                raise ValueError('Канал не проходит минимальные пороги подписчиков, охвата или ERR.')
+            candidate['Контакт'] = contact
+            plan = storage.upsert('telegram', candidate, dry_run=True, confirmed_fields=('Контакт',))
+            if plan['action'] not in ('add', 'update', 'skip'):
+                raise ValidationError('Запись требует дополнительной проверки.')
+            token = secrets.token_urlsafe(32)
+            self.review_preview = {'token': token, 'generation': self.generation,
+                                   'candidate': candidate, 'proof': proof, 'plan': plan,
+                                   'expires_at': datetime.now(timezone.utc).timestamp() + 600}
+            return {'token': token, 'plan': plan, 'proof': proof}
 
     def start(self, options, *, session_setup=False):
         if session_setup:
@@ -496,9 +580,16 @@ HTML = '''<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewp
 <label for="interval">Повторять каждые (минут)</label><input id="interval" type="number" min="5" max="10080" value="60"><button type="button" class="secondary" id="schedule" style="margin-top:12px">Включить расписание</button><p class="hint">Работает, пока приложение или серверный сервис включён.</p></details></form></section>
 <section><h2>Ход выполнения</h2><span id="status" class="badge">Готов к запуску</span><p id="notice" role="alert"></p><div id="problem" hidden style="border:1px solid #bf7653;background:#392820;padding:18px;border-radius:10px;margin-top:20px"><strong id="problem-title"></strong><p id="problem-text"></p></div>
 <div class="cards"><div class="metric"><strong id="accepted">—</strong><span>ПОДХОДЯТ</span></div><div class="metric"><strong id="review">—</strong><span>НУЖНА ПРОВЕРКА</span></div><div class="metric"><strong id="rejected">—</strong><span>ОТКЛОНЕНЫ</span></div></div><div id="results"><p class="hint">Выберите задачу и нажмите Пуск.</p></div>
-<details><summary>Расписание</summary><div id="jobs"></div><p id="scheduler-error" class="hint"></p></details><details><summary>Подробный отчёт</summary><button type="button" id="download-report" class="secondary" disabled>Скачать отчёт JSON</button><pre id="report">Нет задания</pre></details><details><summary>Диагностика</summary><pre id="error">Нет сообщений</pre></details></section></main>
+<section id="review-form" hidden style="margin-top:20px"><h2>Проверка канала</h2><p id="review-title"></p><p class="hint">Укажите проверенные факты. Это личное подтверждение оператора, а не автоматическая проверка источников.</p><label>Страна</label><select id="review-country"><option value="">Выберите</option><option value="ru">РФ</option><option value="by">Беларусь</option></select><label>Источник подтверждения страны</label><input id="review-country-url" type="url" placeholder="https://..."><label>Средний охват публикации</label><input id="review-reach" type="number" min="0" step="1"><label>Источник среднего охвата (не медиана и не рекламный охват)</label><input id="review-reach-url" type="url" placeholder="https://..."><label>Рекламный контакт</label><select id="review-contact"></select><label>Источник предложения рекламы и контакта</label><input id="review-placement-url" type="url" placeholder="https://..."><label><input id="review-verified" type="checkbox"> Я проверил страну, средний охват, предложение рекламы и контакт</label><div class="row"><button id="review-preview" type="button">Показать изменения</button><button id="review-save" type="button" disabled>Сохранить в таблицу</button><button id="review-close" type="button" class="secondary">Закрыть</button></div><pre id="review-plan">Сначала проверьте факты и запросите план.</pre></section><details><summary>Расписание</summary><div id="jobs"></div><p id="scheduler-error" class="hint"></p></details><details><summary>Подробный отчёт</summary><button type="button" id="download-report" class="secondary" disabled>Скачать отчёт JSON</button><pre id="report">Нет задания</pre></details><details><summary>Диагностика</summary><pre id="error">Нет сообщений</pre></details></section></main>
 <script>
 const $=id=>document.getElementById(id),token=__TOKEN__;
+let reviewIndex=null,reviewToken=null,reviewSnapshot=null;
+function clearReviewPlan(){reviewToken=null;$('review-save').disabled=true;}
+function openReview(index,decision){reviewIndex=index;reviewSnapshot={candidate_url:decision.candidate['Ссылка'],observed_at:decision.candidate['Последнее обновление']};clearReviewPlan();$('review-form').hidden=false;$('review-title').textContent=decision.candidate['Название'];for(const id of ['review-country','review-country-url','review-reach','review-reach-url','review-placement-url'])$(id).value='';$('review-verified').checked=false;$('review-plan').textContent='Сначала проверьте факты и запросите план.';const select=$('review-contact');select.replaceChildren();for(const contact of decision.contact_suggestions||[]){const option=document.createElement('option');option.value=contact;option.textContent=contact;select.append(option);}}
+for(const id of ['review-country','review-country-url','review-reach','review-reach-url','review-placement-url','review-contact','review-verified'])$(id).oninput=clearReviewPlan;
+$('review-close').onclick=()=>{$('review-form').hidden=true;clearReviewPlan();};
+$('review-preview').onclick=async()=>{clearReviewPlan();try{const reach=$('review-reach').value.trim();if(!/^[0-9]+$/.test(reach))throw Error('Введите целое неотрицательное число среднего охвата.');const r=await api('/api/review/preview',{...reviewSnapshot,index:reviewIndex,country:$('review-country').value,country_url:$('review-country-url').value,reach:Number(reach),reach_url:$('review-reach-url').value,placement_url:$('review-placement-url').value,contact:$('review-contact').value,verified:$('review-verified').checked});$('review-plan').textContent=JSON.stringify(r.plan,null,2);reviewToken=r.token;$('review-save').disabled=false;}catch(e){$('review-plan').textContent=e.message;}};
+$('review-save').onclick=async()=>{const token=reviewToken;clearReviewPlan();try{const r=await api('/api/review/commit',{token});$('review-plan').textContent=JSON.stringify(r.result,null,2);$('notice').textContent='Проверенный канал обработан. Ручные и заполненные поля защищены.';}catch(e){$('review-plan').textContent=e.message;}};
 let latestReport=null;
 function candidateLink(value){try{const url=new URL(value);if(!['https:','http:'].includes(url.protocol)||url.username||url.password)return null;return url.href;}catch{return null;}}
 $('download-report').onclick=()=>{if(!latestReport)return;const blob=new Blob([JSON.stringify(latestReport,null,2)],{type:'application/json;charset=utf-8'});const url=URL.createObjectURL(blob);const link=document.createElement('a');link.href=url;link.download='agent-report.json';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);};
@@ -517,7 +608,7 @@ async function refreshJobs(){try{const value=await api('/api/jobs');$('scheduler
 
 $('login').onclick=async()=>{try{await api('/api/session',{source:$('source').value});$('notice').textContent='Войдите в открытом браузере и закройте его окно. Пароли и коды вводите только на сайте.';await refresh();}catch(e){$('notice').textContent=e.message;}};
 $('stop').onclick=async()=>{try{await api('/api/stop',{});await refresh();}catch(e){$('notice').textContent=e.message;}};
-async function refresh(){try{const s=await api('/api/status');const names={idle:'Готов к запуску',running:'Идёт сбор',stopping:'Остановка',completed:'Завершён',attention:'Нужна проверка',cancelled:'Остановлен'};$('status').textContent=s.status==='running'&&s.operation==='login'?'Ожидаем входа в браузере':names[s.status]||s.status;const busy=['running','stopping'].includes(s.status);$('start').disabled=busy;$('login').disabled=busy||$('source').value==='telegram-public';$('task').disabled=busy;$('source').disabled=busy;$('stop').disabled=!busy;$('problem').hidden=!s.problem;if(s.problem){$('notice').textContent='';$('problem-title').textContent=s.problem.title;$('problem-text').textContent=s.problem.message;}const r=s.report||{};latestReport=s.report||null;$('download-report').disabled=!latestReport;if(r.session_status==='saved_unverified')$('notice').textContent=r.message;const counts=r.source_summary||{};for(const [id,key] of [['accepted','accept'],['review','review'],['rejected','reject']])$(id).textContent=counts[key]??'—';$('report').textContent=s.report?JSON.stringify(s.report,null,2):'Нет отчёта';$('error').textContent=s.error||'Нет сообщений';if(s.status==='completed'&&s.report&&!s.report.session_setup){$('notice').textContent='Поиск завершён. '+(s.write?'Разрешённые данные сохранены.':'Режим просмотра: таблицы не изменены.');}const err=(s.error||'')+JSON.stringify(r.source_error||{});if(err.includes('auth_required'))$('notice').textContent='Нужен вход в рабочий аккаунт. Задание не ждёт ввода; восстановите сессию отдельно.';const list=$('results');list.replaceChildren();if(s.report){for(const d of (r.decisions||[])){const row=document.createElement('div');row.className='item';const c=d.candidate||{};const title=document.createElement('strong');title.textContent=c['Название компании']||c['Название']||c['Стример']||d.product_observation?.title||'Кандидат без подтверждённого имени';const info=document.createElement('small');info.textContent=({accept:'Принят',review:'Требует проверки',reject:'Отклонён'}[d.decision]||d.decision)+' · '+((d.reasons||[]).join(' / ')||'Проверки пройдены');row.append(title,info);const facts=document.createElement('small');facts.textContent=[c['Ссылка'],c['Подписчики']!==undefined?c['Подписчики'].toLocaleString()+' подписчиков':'',(d.contact_suggestions||[]).length?'Контакты для проверки: '+d.contact_suggestions.join(', '):''].filter(Boolean).join(' · ');row.append(facts);const href=candidateLink(c['Ссылка']||c['Сайт']||d.evidence?.url);if(href){const link=document.createElement('a');link.href=href;link.target='_blank';link.rel='noopener noreferrer';link.textContent='Открыть источник';link.style.color='#79e0ba';row.append(link);}list.append(row);}if(!(r.decisions||[]).length)list.textContent='Нет принятых или рассмотренных кандидатов.';}}catch(e){$('status').textContent='Панель недоступна';}}
+async function refresh(){try{const s=await api('/api/status');const names={idle:'Готов к запуску',running:'Идёт сбор',stopping:'Остановка',completed:'Завершён',attention:'Нужна проверка',cancelled:'Остановлен'};$('status').textContent=s.status==='running'&&s.operation==='login'?'Ожидаем входа в браузере':names[s.status]||s.status;const busy=['running','stopping'].includes(s.status);$('start').disabled=busy;$('login').disabled=busy||$('source').value==='telegram-public';$('task').disabled=busy;$('source').disabled=busy;$('stop').disabled=!busy;$('problem').hidden=!s.problem;if(s.problem){$('notice').textContent='';$('problem-title').textContent=s.problem.title;$('problem-text').textContent=s.problem.message;}const r=s.report||{};latestReport=s.report||null;$('download-report').disabled=!latestReport;if(r.session_status==='saved_unverified')$('notice').textContent=r.message;const counts=r.source_summary||{};for(const [id,key] of [['accepted','accept'],['review','review'],['rejected','reject']])$(id).textContent=counts[key]??'—';$('report').textContent=s.report?JSON.stringify(s.report,null,2):'Нет отчёта';$('error').textContent=s.error||'Нет сообщений';if(s.status==='completed'&&s.report&&!s.report.session_setup){$('notice').textContent='Поиск завершён. '+(s.write?'Разрешённые данные сохранены.':'Режим просмотра: таблицы не изменены.');}const err=(s.error||'')+JSON.stringify(r.source_error||{});if(err.includes('auth_required'))$('notice').textContent='Нужен вход в рабочий аккаунт. Задание не ждёт ввода; восстановите сессию отдельно.';const list=$('results');list.replaceChildren();if(s.report){for(const d of (r.decisions||[])){const row=document.createElement('div');row.className='item';const c=d.candidate||{};const title=document.createElement('strong');title.textContent=c['Название компании']||c['Название']||c['Стример']||d.product_observation?.title||'Кандидат без подтверждённого имени';const info=document.createElement('small');info.textContent=({accept:'Принят',review:'Требует проверки',reject:'Отклонён'}[d.decision]||d.decision)+' · '+((d.reasons||[]).join(' / ')||'Проверки пройдены');row.append(title,info);const facts=document.createElement('small');facts.textContent=[c['Ссылка'],c['Подписчики']!==undefined?c['Подписчики'].toLocaleString()+' подписчиков':'',(d.contact_suggestions||[]).length?'Контакты для проверки: '+d.contact_suggestions.join(', '):''].filter(Boolean).join(' · ');row.append(facts);const href=candidateLink(c['Ссылка']||c['Сайт']||d.evidence?.url);if(href){const link=document.createElement('a');link.href=href;link.target='_blank';link.rel='noopener noreferrer';link.textContent='Открыть источник';link.style.color='#79e0ba';row.append(link);}if(r.source==='telegram-public'&&d.decision==='review'&&d.placement?.status==='offered'&&(d.contact_suggestions||[]).length){const button=document.createElement('button');button.type='button';button.className='secondary';const reviewed=(r.manual_reviews||[]).some(item=>item.candidate?.['Ссылка']===c['Ссылка']);button.textContent=reviewed?'Проверка выполнена':'Проверить и сохранить';button.disabled=reviewed;button.onclick=()=>openReview(r.decisions.indexOf(d),d);row.append(button);}list.append(row);}if(!(r.decisions||[]).length)list.textContent='Нет принятых или рассмотренных кандидатов.';}}catch(e){$('status').textContent='Панель недоступна';}}
 refresh();refreshJobs();setInterval(refresh,2000);setInterval(refreshJobs,5000);
 </script></html>'''
 
@@ -583,6 +674,17 @@ def make_server(controller=None, port=8765):
                     if scheduler.active is not None:
                         raise ValueError('Дождитесь завершения задания расписания.')
                     controller.start(body)
+                elif self.path in ('/api/review/preview', '/api/review/commit'):
+                    if scheduler.active is not None:
+                        raise ValueError('Дождитесь завершения задания расписания.')
+                    from safe_writer import StorageError
+                    from validation import ValidationError
+                    try:
+                        result = controller.review_telegram(body, commit=self.path.endswith('/commit'))
+                    except (StorageError, ValidationError) as error:
+                        raise ValueError(str(error)) from error
+                    self.send(200, result)
+                    return
                 elif self.path == '/api/session':
                     if scheduler.active is not None:
                         raise ValueError('Дождитесь завершения задания расписания.')
