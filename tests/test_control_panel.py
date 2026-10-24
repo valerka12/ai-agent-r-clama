@@ -765,6 +765,14 @@ class AdvertiserFactsPanelTests(unittest.TestCase):
         self.assertIn('--enrich-sites',args)
         self.assertNotIn('--brand-proofs',args)  # File created only for an actual process.
 
+    def test_uploaded_facts_supply_card_urls_when_seed_is_empty(self):
+        options = self.options()
+        options['seed'] = ''
+        args = build_command(options)
+        self.assertIn('--urls',args)
+        self.assertIn(next(iter(options['proofs'])),args)
+        self.assertNotIn('--discover',args)
+
     def test_unconfirmed_stale_wrong_platform_and_malformed_facts_are_rejected(self):
         from copy import deepcopy
         options = self.options()
