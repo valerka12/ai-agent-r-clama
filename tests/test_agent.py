@@ -15,6 +15,9 @@ from validation import ValidationError
 
 class AgentTests(unittest.TestCase):
     def setUp(self):
+        isolation = patch.dict('os.environ', {'ADRESEARCH_GOOGLE_OUTPUT':'0'})
+        isolation.start()
+        self.addCleanup(isolation.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name) / "storage"

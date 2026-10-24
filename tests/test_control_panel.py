@@ -825,3 +825,14 @@ class AdvertiserFactsPanelTests(unittest.TestCase):
                 self.assertEqual(scheduler.jobs()[0]['options']['proofs'],options['proofs'])
             finally:
                 scheduler.close()
+
+
+class StorageFailureDisplayTests(unittest.TestCase):
+    def test_write_failure_is_visible_even_without_stderr(self):
+        controller = Controller(report_dir=False)
+        controller.state.update(status='attention', report={'results': [
+            {'action': 'error', 'reason': 'Результат записи неизвестен.'}]})
+        problem = controller.snapshot()['problem']
+        self.assertEqual(problem['title'], 'Запись не завершена')
+        self.assertIn('Результат записи неизвестен.', problem['message'])
+        self.assertIn('журнал', problem['message'])

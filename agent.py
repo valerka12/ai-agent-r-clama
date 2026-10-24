@@ -9,8 +9,13 @@ from copy import deepcopy
 import json
 from pathlib import Path
 
-from safe_writer import SafeWriter, StorageError
+from safe_writer import SafeWriter, StorageError, default_writer
 from validation import ValidationError, validate_all_schemas, validate_schema
+
+
+def _default_storage():
+    import os
+    return default_writer() if os.environ.get('ADRESEARCH_GOOGLE_OUTPUT') == '1' else SafeWriter()
 
 
 class _PreviewWriter(SafeWriter):
@@ -19,14 +24,21 @@ class _PreviewWriter(SafeWriter):
     def __init__(self, source):
         super().__init__(source.root)
         self.tables = {}
+        self.source = source
 
     def _load(self, table):
         if table not in self.tables:
-            self.tables[table] = super()._load(table)
+            self.tables[table] = self.source._load(table)
         return deepcopy(self.tables[table])
 
     def upsert(self, table, candidate, *, dry_run=True, confirmed_fields=()):
+        if hasattr(self.source,'precheck'):
+            skipped=self.source.precheck(table,candidate,self._load(table)[2])
+            if skipped:
+                return skipped
         result, path, original, rows = self._plan(table, candidate, confirmed_fields)
+        if hasattr(self.source,'filter_plan'):
+            result=self.source.filter_plan(table,result,virtual=True)
         if result["action"] in {"add", "update"}:
             self.tables[table] = (path, original, rows)
         return result
@@ -45,7 +57,7 @@ def run_candidates(table, candidates, *, dry_run=True, writer=None):
         raise ValidationError("dry_run должен быть bool.")
     if not isinstance(candidates, list):
         raise ValidationError("Ожидается JSON-массив кандидатов.")
-    storage = writer if writer is not None else SafeWriter()
+    storage = writer if writer is not None else _default_storage()
     target = _PreviewWriter(storage) if dry_run else storage
     summary = dict(total=len(candidates), processed=0, added=0, updated=0,
                    skipped=0, rejected=0, failed=0, remaining=len(candidates))
@@ -184,7 +196,7 @@ def run_source(source_name, *, writer=None, dry_run=True, payload=None,
         raise ValidationError("Неизвестный источник.")
     accepted = [(index, decision["candidate"]) for index, decision in enumerate(decisions)
                 if decision["decision"] == "accept"]
-    storage = writer if writer is not None else SafeWriter()
+    storage = writer if writer is not None else _default_storage()
     report = run_candidates(table, [candidate for _, candidate in accepted],
                             dry_run=True if source_failure else dry_run, writer=storage)
     report["source"] = source_name

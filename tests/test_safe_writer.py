@@ -2,6 +2,7 @@
 
 import csv
 import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -221,3 +222,236 @@ class SafeWriterTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GoogleSheetsStorageTests(unittest.TestCase):
+    def setUp(self):
+        from safe_writer import GoogleSheetsStore,_atomic_write
+        self.temp_google = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_google.cleanup)
+        self.google_root = Path(self.temp_google.name)
+        self.link = {'spreadsheet_id':'A'*30,'sheet_id':7,'sheet_title':'Площадки'}
+        self.store = GoogleSheetsStore(self.google_root)
+        _atomic_write(self.store._path('bindings.json'),json.dumps({'version':1,'links':{'telegram':self.link}}).encode())
+        self.client = self.FakeClient(self.link,list(config.TELEGRAM_COLUMNS))
+
+    class FakeClient:
+        def __init__(self,link,columns):
+            self.link=link;self.raw=[columns];self.effective=[columns.copy()]
+            self.formats={};self.calls=[];self.error=None;self.snapshot_count=0;self.mutate_at=None
+        def snapshot(self,binding,expected=None,display=False):
+            from copy import deepcopy
+            from safe_writer import _google_snapshot
+            self.snapshot_count+=1
+            if self.mutate_at==self.snapshot_count:
+                self.raw[0]=self.raw[0][::-1]
+                self.effective[0]=self.effective[0][::-1]
+            result=_google_snapshot(self.link,self.link['sheet_title'],deepcopy(self.raw),deepcopy(self.effective),formats=self.formats.copy())
+            if expected is not None and expected!=result['table']:
+                raise ValidationError('Wrong schema')
+            return result
+        def append(self,binding,cells):
+            from copy import deepcopy
+            self.calls.append(deepcopy(cells))
+            if self.error:
+                raise self.error
+            row=[c.get('userEnteredValue',{}).get('stringValue',c.get('userEnteredValue',{}).get('numberValue','')) for c in cells]
+            self.raw.append(row);self.effective.append(row.copy())
+            return {}
+
+    def candidate(self,link='https://t.me/new_channel',name='Новый канал'):
+        return {'Название':name,'Ссылка':link,'Подписчики':1000,'Средний охват':250,'ERR (%)':25.0}
+
+    def writer(self):
+        from safe_writer import GoogleSheetWriter
+        return GoogleSheetWriter(self.google_root,client=self.client)
+
+    def test_link_parsing_uses_fixed_google_host_and_explicit_gid(self):
+        from safe_writer import GoogleSheetsStore
+        result=GoogleSheetsStore.parse_url('https://docs.google.com/spreadsheets/d/'+'A'*30+'/edit?usp=sharing#gid=7')
+        self.assertEqual(result,{'spreadsheet_id':'A'*30,'sheet_id':7})
+        for url in ('https://evil.test/spreadsheets/d/'+'A'*30+'/edit',
+                    'http://docs.google.com/spreadsheets/d/'+'A'*30+'/edit',
+                    'https://docs.google.com/spreadsheets/d/'+'A'*30+'/edit#gid=no',
+                    'https://docs.google.com/spreadsheets/d/'+'A'*30+'/edit?gid=1#gid=2'):
+            with self.subTest(url=url),self.assertRaises(ValidationError):
+                GoogleSheetsStore.parse_url(url)
+
+    def test_three_schemas_are_detected_without_changing_column_order(self):
+        from safe_writer import _google_snapshot
+        for name,columns in [('advertisers',config.ADVERTISER_COLUMNS),('telegram',config.TELEGRAM_COLUMNS),('streamers',config.STREAMER_COLUMNS)]:
+            header=list(reversed(columns))
+            result=_google_snapshot(self.link,'Лист',[header],[header])
+            self.assertEqual(result['table'],name)
+            self.assertEqual(result['positions'][columns[0]],len(columns)-1)
+            self.assertEqual(result['raw'][0],header)
+
+    def test_ambiguous_missing_and_unknown_headers_are_rejected(self):
+        from safe_writer import _google_snapshot
+        columns=list(config.TELEGRAM_COLUMNS)
+        for header in (columns[:-1],columns+[columns[0]],columns+['Мой столбец'],['Номер','Название']):
+            with self.subTest(header=header),self.assertRaises(ValidationError):
+                _google_snapshot(self.link,'Лист',[header],[header])
+
+    def test_preview_maps_each_value_to_actual_reordered_column_without_writes(self):
+        header=list(reversed(config.TELEGRAM_COLUMNS))
+        self.client.raw=[header];self.client.effective=[header.copy()]
+        before={p.relative_to(self.google_root):p.read_bytes() for p in self.google_root.rglob('*') if p.is_file()}
+        result=self.writer().upsert('telegram',self.candidate(),dry_run=True)
+        self.assertEqual(result['action'],'add')
+        self.assertEqual(result['target']['row'],2)
+        cells={c['field']:c['cell'] for c in result['target']['cells']}
+        self.assertEqual(cells['Номер'],'N2')
+        self.assertEqual(cells['Название'],'M2')
+        self.assertEqual(self.client.calls,[])
+        self.assertEqual(before,{p.relative_to(self.google_root):p.read_bytes() for p in self.google_root.rglob('*') if p.is_file()})
+
+    def test_append_keeps_manual_values_and_formulas_and_creates_backup_journal(self):
+        from copy import deepcopy
+        cols=list(config.TELEGRAM_COLUMNS)
+        old=['' for _ in cols]
+        old[0]=1;old[1]='Существующий';old[2]='https://t.me/old_channel';old[10]='Мой статус';old[12]='=CONCAT("Ручной"," комментарий")'
+        self.client.raw.append(old);self.client.effective.append(old.copy())
+        baseline=deepcopy(self.client.raw)
+        result=self.writer().upsert('telegram',dict(self.candidate(),Статус='Нельзя записывать',Комментарий='Нельзя',Контакт='@ads'),dry_run=False)
+        self.assertEqual(result['action'],'add')
+        self.assertEqual(self.client.raw[:-1],baseline)
+        self.assertEqual(len(self.client.calls),1)
+        cells=self.client.calls[0]
+        for field in ('Статус','Комментарий','Рекламодатель','Контакт'):
+            self.assertEqual(cells[cols.index(field)],{})
+        self.assertEqual(len(list((self.google_root/'backups').rglob('*.csv'))),3)
+        self.assertIn('committed',(self.google_root/'logs/changes_log.csv').read_text(encoding='utf-8-sig'))
+        self.assertFalse((self.google_root/'data/telegram.csv').exists())
+
+    def test_existing_row_is_never_changed_even_when_empty_auto_fields_exist(self):
+        cols=list(config.TELEGRAM_COLUMNS);old=['' for _ in cols]
+        old[0]=1;old[1]='Сохранить название';old[2]='https://t.me/new_channel';old[12]='Сохранить комментарий'
+        self.client.raw.append(old);self.client.effective.append(old.copy())
+        result=self.writer().upsert('telegram',self.candidate(),dry_run=False)
+        self.assertEqual(result['action'],'skip')
+        self.assertEqual(self.client.calls,[])
+        self.assertEqual(self.client.raw[1],old)
+
+    def test_percent_format_is_respected_for_new_err_value(self):
+        self.client.formats[config.TELEGRAM_COLUMNS.index('ERR (%)')]='PERCENT'
+        self.writer().upsert('telegram',self.candidate(),dry_run=False)
+        actual=self.client.calls[0][config.TELEGRAM_COLUMNS.index('ERR (%)')]['userEnteredValue']['numberValue']
+        self.assertEqual(actual,.25)
+
+    def test_read_change_before_append_aborts_without_remote_write(self):
+        self.client.mutate_at=4  # initial read, plan, backup, final re-read
+        with self.assertRaises(StorageError):
+            self.writer().upsert('telegram',self.candidate(),dry_run=False)
+        self.assertEqual(self.client.calls,[])
+
+    def test_uncertain_write_is_not_retried_and_blocks_next_write(self):
+        from safe_writer import GoogleRequestError
+        self.client.error=GoogleRequestError()
+        writer=self.writer()
+        with self.assertRaises(StorageError):writer.upsert('telegram',self.candidate(),dry_run=False)
+        self.assertEqual(len(self.client.calls),1)
+        with self.assertRaises(StorageError):writer.upsert('telegram',self.candidate('https://t.me/other_channel','Другой'),dry_run=False)
+        self.assertEqual(len(self.client.calls),1)
+        log=(self.google_root/'logs/changes_log.csv').read_text(encoding='utf-8-sig')
+        self.assertIn('prepared',log);self.assertNotIn('committed',log)
+
+    def test_known_forbidden_request_is_recorded_as_aborted(self):
+        from safe_writer import GoogleRequestError
+        self.client.error=GoogleRequestError(403)
+        with self.assertRaises(StorageError):self.writer().upsert('telegram',self.candidate(),dry_run=False)
+        self.assertIn('aborted',(self.google_root/'logs/changes_log.csv').read_text(encoding='utf-8-sig'))
+        self.assertEqual(len(self.client.calls),1)
+
+    def test_array_formulas_prevent_automatic_addition(self):
+        cols=list(config.TELEGRAM_COLUMNS);raw=['' for _ in cols];effective=raw.copy()
+        raw[0]='=SEQUENCE(10)';effective[0]=1
+        raw[1]=effective[1]='Старый канал';raw[2]=effective[2]='https://t.me/old_channel'
+        self.client.raw.append(raw);self.client.effective.append(effective)
+        with self.assertRaises(ValidationError):self.writer().upsert('telegram',self.candidate(),dry_run=True)
+        self.assertEqual(self.client.calls,[])
+
+    def test_binding_change_is_not_silently_redirected(self):
+        from safe_writer import _atomic_write
+        writer=self.writer()
+        changed=self.link|{'sheet_id':9}
+        _atomic_write(self.store._path('bindings.json'),json.dumps({'version':1,'links':{'telegram':changed}}).encode())
+        with self.assertRaises(StorageError):writer.upsert('telegram',self.candidate(),dry_run=False)
+        self.assertEqual(self.client.calls,[])
+
+    def test_preview_batch_uses_google_snapshot_and_virtual_previous_candidates(self):
+        from agent import run_candidates
+        report=run_candidates('telegram',[self.candidate(),self.candidate('https://t.me/second_channel','Вторая площадка'),self.candidate()],writer=self.writer(),dry_run=True)
+        self.assertEqual(report['summary']['added'],2)
+        self.assertEqual(report['summary']['skipped'],1)
+        self.assertEqual([r['target']['row'] for r in report['results'] if r['action']=='add'],[2,3])
+        self.assertEqual(self.client.calls,[])
+
+    def test_attaching_replacement_requires_explicit_intent(self):
+        from safe_writer import GoogleSheetsStore
+        store=GoogleSheetsStore(self.google_root)
+        self.client.link=self.link|{'sheet_id':9}
+        with self.assertRaises(ValidationError):
+            store.attach('https://docs.google.com/spreadsheets/d/'+'A'*30+'/edit#gid=9',client=self.client)
+        self.assertEqual(store.bindings()['telegram']['sheet_id'],7)
+        result=store.attach('https://docs.google.com/spreadsheets/d/'+'A'*30+'/edit#gid=9',replace=True,client=self.client)
+        self.assertEqual(result['binding']['sheet_id'],9)
+        self.assertEqual(self.client.calls,[])
+
+    def test_unknown_credentials_are_rejected_without_disclosing_key(self):
+        from safe_writer import GoogleSheetsStore
+        store=GoogleSheetsStore(self.google_root)
+        for value in ({'private_key':'SECRET'}, {'type':'service_account','client_email':'x@x.iam.gserviceaccount.com','token_uri':'https://evil.test/token','private_key':'SECRET'}):
+            with self.assertRaises(ValidationError) as context:store.save_credentials(value)
+            self.assertNotIn('SECRET',str(context.exception))
+        self.assertFalse(store._path('service_account.json').exists())
+
+
+class GoogleSheetsWireTests(unittest.TestCase):
+    def test_append_uses_only_new_rows_and_value_field_mask(self):
+        from safe_writer import GoogleSheetsAPI
+        from unittest.mock import Mock
+        client = GoogleSheetsAPI.__new__(GoogleSheetsAPI)
+        client._call = Mock(return_value={})
+        cells = [{'userEnteredValue': {'stringValue': '=literal text'}}, {}]
+        client.append({'spreadsheet_id': 'A'*30, 'sheet_id': 7}, cells)
+        client._call.assert_called_once_with('POST', 'A'*30, ':batchUpdate', body={
+            'requests': [{'appendCells': {'sheetId': 7, 'rows': [{'values': cells}],
+                                         'fields': 'userEnteredValue'}}]})
+
+    def test_http_failure_does_not_retry_or_leak_response(self):
+        from safe_writer import GoogleSheetsAPI, GoogleRequestError
+        from unittest.mock import Mock, MagicMock
+        client = GoogleSheetsAPI.__new__(GoogleSheetsAPI)
+        client.last_request = 0
+        client.session = Mock()
+        response = MagicMock(status_code=403)
+        response.__enter__.return_value = response
+        client.session.request.return_value = response
+        with self.assertRaises(GoogleRequestError) as context:
+            client._call('POST', 'A'*30, ':batchUpdate', body={})
+        client.session.request.assert_called_once()
+        response.iter_content.assert_not_called()
+        self.assertEqual(context.exception.status, 403)
+
+
+class GoogleCredentialFileTests(unittest.TestCase):
+    def test_valid_generated_key_stays_private_and_out_of_status(self):
+        import os
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.hazmat.primitives import serialization
+        from safe_writer import GoogleSheetsStore
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        pem = private_key.private_bytes(serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8, serialization.NoEncryption()).decode()
+        info = {'type': 'service_account', 'client_email': 'test@example.iam.gserviceaccount.com',
+                'token_uri': 'https://oauth2.googleapis.com/token', 'private_key': pem}
+        with tempfile.TemporaryDirectory() as root:
+            store = GoogleSheetsStore(root)
+            status = store.save_credentials(info)
+            self.assertTrue(status['configured'])
+            self.assertNotIn(pem, json.dumps(status))
+            self.assertEqual(store.credentials()['private_key'], pem)
+            if os.name == 'posix':
+                self.assertEqual(store._path('service_account.json').stat().st_mode & 0o777, 0o600)
+                self.assertEqual(store.directory.stat().st_mode & 0o777, 0o700)

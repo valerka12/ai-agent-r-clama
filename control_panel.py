@@ -252,12 +252,12 @@ class Controller:
                     pass
 
     def table_snapshot(self, table, *, writer=None):
-        from safe_writer import SafeWriter
+        from safe_writer import make_writer
         columns = {'advertisers': config.ADVERTISER_COLUMNS, 'telegram': config.TELEGRAM_COLUMNS,
                    'streamers': config.STREAMER_COLUMNS}
         if table not in columns:
             raise ValueError('Неизвестная таблица.')
-        storage = writer if writer is not None else SafeWriter()
+        storage = writer if writer is not None else make_writer(google=True)
         rows = storage.read(table)
         result = {'table': table, 'columns': list(columns[table]), 'rows': rows}
         if len(json.dumps(result, ensure_ascii=False).encode('utf-8')) > 2_000_000:
@@ -266,17 +266,23 @@ class Controller:
 
     def snapshot(self):
         with self.lock:
-            return dict(self.state, problem=explain_failure(self.state.get('error') or
-                        (self.state.get('report') or {}).get('source_error', {}).get('reason')))
+            report = self.state.get('report') or {}
+            storage_error = next((item.get('reason') for item in report.get('results', [])
+                                  if item.get('action') == 'error'), None)
+            problem = ({'title': 'Запись не завершена',
+                        'message': str(storage_error) + ' Проверьте журнал изменений и резервную копию перед повторным запуском.'}
+                       if storage_error else explain_failure(self.state.get('error') or
+                           report.get('source_error', {}).get('reason')))
+            return dict(self.state, problem=problem)
 
     def review_telegram(self, body, *, commit=False, writer=None):
         """Явная проверка оператором; автоматический источник остаётся read-only."""
         from datetime import datetime, timezone
-        from safe_writer import SafeWriter
+        from safe_writer import make_writer
         from validation import ValidationError, calculate_err, validate_url, validate_counter
         if not isinstance(body, dict):
             raise ValueError('Нужны данные проверки.')
-        storage = writer if writer is not None else SafeWriter()
+        storage = writer if writer is not None else make_writer(google=True)
         with self.lock:
             if self.state['status'] in ('running', 'stopping'):
                 raise ValueError('Дождитесь окончания поиска.')
@@ -353,6 +359,27 @@ class Controller:
                                    'expires_at': datetime.now(timezone.utc).timestamp() + 600}
             return {'token': token, 'plan': plan, 'proof': proof}
 
+    def google_status(self):
+        from safe_writer import GoogleSheetsStore
+        return GoogleSheetsStore().status()
+
+    def google_setup(self, body, *, credentials=False):
+        from safe_writer import GoogleSheetsStore
+        if not isinstance(body,dict):
+            raise ValueError('Нужны параметры подключения Google Sheets.')
+        with self.lock:
+            if self.state['status'] in ('running','stopping'):
+                raise ValueError('Дождитесь завершения текущего задания.')
+            store=GoogleSheetsStore()
+            if credentials:
+                if body.get('save_locally') is not True:
+                    raise ValueError('Подтвердите локальное сохранение выбранного ключа.')
+                return store.save_credentials(body.get('credentials'))
+            expected=body.get('table') or None
+            if expected is not None and expected not in ('advertisers','telegram','streamers'):
+                raise ValueError('Неизвестный тип таблицы.')
+            return store.attach(body.get('url'),expected,replace=body.get('replace') is True)
+
     def start(self, options, *, session_setup=False):
         if session_setup:
             source = options.get('source')
@@ -364,6 +391,24 @@ class Controller:
             args = [str(interpreter), '-m', 'agent', '--setup-session', source.removesuffix('-web')]
         else:
             args = build_command(options)
+        from safe_writer import GoogleSheetsStore, StorageError
+        import hashlib
+        google_binding=None
+        output_table=None
+        if not session_setup:
+            output_table=('telegram' if options['source'] in ('telegram-public','tgstat-web') else
+                          'streamers' if options['source'] in ('twitch-web','kick-web') else 'advertisers')
+            try:
+                store=GoogleSheetsStore()
+                google_binding=store.bindings().get(output_table)
+                if google_binding and not store.status()['configured']:
+                    raise ValueError('Для подключённого листа требуется локальный JSON-ключ Google. Запись в CSV вместо него не выполняется.')
+            except StorageError as error:
+                raise ValueError(str(error)) from error
+        environment=dict(os.environ,PYTHONIOENCODING='utf-8',PYTHONUTF8='1',
+                         ADRESEARCH_GOOGLE_OUTPUT='1' if google_binding else '0',
+                         ADRESEARCH_GOOGLE_TABLE=output_table or '',
+                         ADRESEARCH_GOOGLE_TARGET=hashlib.sha256(json.dumps(google_binding,sort_keys=True).encode()).hexdigest() if google_binding else '')
         with self.lock:
             if self.state['status'] in ('running', 'stopping'):
                 raise ValueError('Сбор уже запущен. Дождитесь завершения или остановите его.')
@@ -386,7 +431,7 @@ class Controller:
                             str(Path(spool.name)/'stderr.txt'), *args[3:]]
                 self.process = subprocess.Popen(args, cwd=config.PROJECT_DIR, stdin=subprocess.DEVNULL,
                                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                                env=dict(os.environ, PYTHONIOENCODING='utf-8', PYTHONUTF8='1'),
+                                                env=environment,
                                                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
                                                 start_new_session=(os.name == 'posix'))
             except (OSError, ValueError):
@@ -395,7 +440,8 @@ class Controller:
                 raise
             process = self.process
             self.state = {'status': 'running', 'source': options['source'], 'write': options.get('write', False),
-                          'report': None, 'error': '', 'exit_code': None, 'operation': 'login' if session_setup else 'search'}
+                          'report': None, 'error': '', 'exit_code': None, 'operation': 'login' if session_setup else 'search',
+                          'destination':google_binding['sheet_title'] if google_binding else 'Локальный CSV'}
         threading.Thread(target=self._collect, args=(process, generation, spool), daemon=True).start()
 
     def _collect(self, process, generation, spool=None):
@@ -722,7 +768,7 @@ HTML = '''<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewp
 <label for="interval">Повторять каждые (минут)</label><input id="interval" type="number" min="5" max="10080" value="60"><button type="button" class="secondary" id="schedule" style="margin-top:12px">Включить расписание</button><p class="hint">Работает, пока приложение или серверный сервис включён.</p></details></form></section>
 <section><h2>Ход выполнения</h2><span id="status" class="badge">Готов к запуску</span><p id="notice" role="alert"></p><p id="storage-notice" class="hint" role="status"></p><div id="problem" hidden style="border:1px solid #bf7653;background:#392820;padding:18px;border-radius:10px;margin-top:20px"><strong id="problem-title"></strong><p id="problem-text"></p></div>
 <div class="cards"><div class="metric"><strong id="accepted">—</strong><span>ПОДХОДЯТ</span></div><div class="metric"><strong id="review">—</strong><span>НУЖНА ПРОВЕРКА</span></div><div class="metric"><strong id="rejected">—</strong><span>ОТКЛОНЕНЫ</span></div></div><div id="results"><p class="hint">Выберите задачу и нажмите Пуск.</p></div>
-<section id="review-form" hidden style="margin-top:20px"><h2>Проверка канала</h2><p id="review-title"></p><p class="hint">Укажите проверенные факты. Это личное подтверждение оператора, а не автоматическая проверка источников.</p><label>Страна</label><select id="review-country"><option value="">Выберите</option><option value="ru">РФ</option><option value="by">Беларусь</option></select><label>Источник подтверждения страны</label><input id="review-country-url" type="url" placeholder="https://..."><label>Средний охват публикации</label><input id="review-reach" type="number" min="0" step="1"><label>Источник среднего охвата (не медиана и не рекламный охват)</label><input id="review-reach-url" type="url" placeholder="https://..."><label>Рекламный контакт</label><select id="review-contact"></select><label>Источник предложения рекламы и контакта</label><input id="review-placement-url" type="url" placeholder="https://..."><label><input id="review-verified" type="checkbox"> Я проверил страну, средний охват, предложение рекламы и контакт</label><div class="row"><button id="review-preview" type="button">Показать изменения</button><button id="review-save" type="button" disabled>Сохранить в таблицу</button><button id="review-close" type="button" class="secondary">Закрыть</button></div><pre id="review-plan">Сначала проверьте факты и запросите план.</pre></section><details><summary>Мои таблицы</summary><label>Таблица</label><select id="table-select"><option value="advertisers">Рекламодатели</option><option value="telegram">Telegram-каналы</option><option value="streamers">Стримеры Twitch/Kick</option></select><div class="row"><button type="button" class="secondary" id="table-load">Открыть таблицу</button><button type="button" class="secondary" id="table-download" disabled>Скачать CSV</button></div><p class="hint" id="table-notice">Просмотр и скачивание не меняют данные. Здесь нет удаления и перезаписи ячеек.</p><div id="table-view" style="overflow:auto;max-height:400px"></div></details><details><summary>Расписание</summary><div id="jobs"></div><p id="scheduler-error" class="hint"></p></details><details><summary>Подробный отчёт</summary><button type="button" id="download-report" class="secondary" disabled>Скачать отчёт JSON</button><pre id="report">Нет задания</pre></details><details><summary>Диагностика</summary><pre id="error">Нет сообщений</pre></details></section></main>
+<section id="review-form" hidden style="margin-top:20px"><h2>Проверка канала</h2><p id="review-title"></p><p class="hint">Укажите проверенные факты. Это личное подтверждение оператора, а не автоматическая проверка источников.</p><label>Страна</label><select id="review-country"><option value="">Выберите</option><option value="ru">РФ</option><option value="by">Беларусь</option></select><label>Источник подтверждения страны</label><input id="review-country-url" type="url" placeholder="https://..."><label>Средний охват публикации</label><input id="review-reach" type="number" min="0" step="1"><label>Источник среднего охвата (не медиана и не рекламный охват)</label><input id="review-reach-url" type="url" placeholder="https://..."><label>Рекламный контакт</label><select id="review-contact"></select><label>Источник предложения рекламы и контакта</label><input id="review-placement-url" type="url" placeholder="https://..."><label><input id="review-verified" type="checkbox"> Я проверил страну, средний охват, предложение рекламы и контакт</label><div class="row"><button id="review-preview" type="button">Показать изменения</button><button id="review-save" type="button" disabled>Сохранить в таблицу</button><button id="review-close" type="button" class="secondary">Закрыть</button></div><pre id="review-plan">Сначала проверьте факты и запросите план.</pre></section><details><summary>Подключить Google Sheets</summary><p class="hint">Доступ — через служебный аккаунт. Таблицу не нужно открывать для всех. Агент добавляет только новые строки; существующие значения, формулы и форматирование не редактируются. Не меняйте колонки во время записи.</p><label>JSON-ключ Google (только локально)</label><input type="file" id="google-key" accept=".json,application/json"><label><input type="checkbox" id="google-save-key"> Разрешаю сохранить выбранный ключ на этом компьютере для подключённых листов</label><button type="button" id="google-key-save" class="secondary">Сохранить ключ локально</button><p class="hint" id="google-status"></p><label>Ссылка на конкретный лист Google Sheets</label><input type="url" id="google-url" placeholder="https://docs.google.com/spreadsheets/d/…/edit#gid=0" style="width:100%;padding:10px"><label>Тип данных</label><select id="google-type"><option value="">Определить по заголовкам</option><option value="advertisers">Рекламодатели — 22 колонки</option><option value="telegram">Telegram — 14 колонок</option><option value="streamers">Стримеры — 13 колонок</option></select><label><input type="checkbox" id="google-replace"> Заменить уже подключённый лист этого типа (данные в нём не удаляются)</label><button type="button" id="google-attach" class="secondary">Проверить и подключить</button><pre id="google-map">Лист и расположение полей появятся после проверки ссылки.</pre></details><details><summary>Мои таблицы</summary><label>Таблица</label><select id="table-select"><option value="advertisers">Рекламодатели</option><option value="telegram">Telegram-каналы</option><option value="streamers">Стримеры Twitch/Kick</option></select><div class="row"><button type="button" class="secondary" id="table-load">Открыть таблицу</button><button type="button" class="secondary" id="table-download" disabled>Скачать CSV</button></div><p class="hint" id="table-notice">Просмотр и скачивание не меняют данные. Здесь нет удаления и перезаписи ячеек.</p><div id="table-view" style="overflow:auto;max-height:400px"></div></details><details><summary>Расписание</summary><div id="jobs"></div><p id="scheduler-error" class="hint"></p></details><details><summary>Подробный отчёт</summary><button type="button" id="download-report" class="secondary" disabled>Скачать отчёт JSON</button><pre id="report">Нет задания</pre></details><details><summary>Диагностика</summary><pre id="error">Нет сообщений</pre></details></section></main>
 <script>
 const $=id=>document.getElementById(id),token=__TOKEN__;
 let reviewIndex=null,reviewToken=null,reviewSnapshot=null;
@@ -732,12 +778,15 @@ for(const id of ['review-country','review-country-url','review-reach','review-re
 $('review-close').onclick=()=>{$('review-form').hidden=true;clearReviewPlan();};
 $('review-preview').onclick=async()=>{clearReviewPlan();try{const reach=$('review-reach').value.trim();if(!/^[0-9]+$/.test(reach))throw Error('Введите целое неотрицательное число среднего охвата.');const r=await api('/api/review/preview',{...reviewSnapshot,index:reviewIndex,country:$('review-country').value,country_url:$('review-country-url').value,reach:Number(reach),reach_url:$('review-reach-url').value,placement_url:$('review-placement-url').value,contact:$('review-contact').value,verified:$('review-verified').checked});$('review-plan').textContent=reviewPlanText(r.plan);reviewToken=r.token;$('review-save').disabled=false;}catch(e){$('review-plan').textContent=e.message;}};
 $('review-save').onclick=async()=>{const token=reviewToken;clearReviewPlan();try{const r=await api('/api/review/commit',{token});$('review-plan').textContent='Обработано.\\n'+reviewPlanText(r.result);$('notice').textContent='Проверенный канал обработан. Ручные и заполненные поля защищены.';}catch(e){$('review-plan').textContent=e.message;}};
+async function refreshGoogle(){try{const state=await api('/api/google/status');const names={advertisers:'Рекламодатели',telegram:'Telegram',streamers:'Стримеры'};$('google-status').textContent=(state.configured?'Ключ сохранён. Предоставьте доступ «Редактор» этому адресу: '+state.email:'Выберите JSON-ключ служебного аккаунта Google.')+' Подключения: '+Object.entries(state.links||{}).map(([type,link])=>(names[type]||type)+' → '+link.sheet_title).join('; ');}catch(e){$('google-status').textContent=e.message;}}
+$('google-key-save').onclick=async()=>{try{const file=$('google-key').files[0];if(!file||file.size>12000)throw Error('Выберите JSON-ключ Google размером до 12 КБ.');if(!$('google-save-key').checked)throw Error('Подтвердите локальное сохранение ключа.');await api('/api/google/key',{credentials:JSON.parse(await file.text()),save_locally:true});$('google-key').value='';$('google-save-key').checked=false;await refreshGoogle();}catch(e){$('google-status').textContent=e.message;}};
+$('google-attach').onclick=async()=>{const button=$('google-attach');button.disabled=true;try{const result=await api('/api/google/attach',{url:$('google-url').value,table:$('google-type').value,replace:$('google-replace').checked});const modes={manual:'ручное поле — не заполняется',confirm:'требует подтверждения', 'auto-new-row':'автоматически, только в новой строке'};$('google-map').textContent='Подключён лист: '+result.binding.sheet_title+' ('+result.table+').'+String.fromCharCode(10)+result.columns.map(c=>c.column+' → '+c.field+' — '+modes[c.mode]).join(String.fromCharCode(10));await refreshGoogle();}catch(e){$('google-map').textContent=e.message;}finally{button.disabled=false;}};
 let loadedTable=null;
 function tableCSV(value){return '\ufeff'+[value.columns,...value.rows.map(row=>value.columns.map(column=>row[column]??''))].map(row=>row.map(cell=>'"'+String(cell).replaceAll('"','""')+'"').join(',')).join('\\r\\n')+'\\r\\n';}
 $('table-load').onclick=async()=>{loadedTable=null;$('table-download').disabled=true;try{const value=await api('/api/tables/'+$('table-select').value);loadedTable=value;const table=document.createElement('table');table.style.borderCollapse='collapse';for(const cells of [value.columns,...value.rows.slice(0,100).map(row=>value.columns.map(c=>row[c]))]){const tr=document.createElement('tr');for(const cell of cells){const td=document.createElement('td');td.textContent=cell??'';td.style.cssText='border:1px solid #455464;padding:8px;white-space:pre-wrap;min-width:110px';tr.append(td);}table.append(tr);}$('table-view').replaceChildren(table);$('table-notice').textContent='Показано '+Math.min(value.rows.length,100)+' из '+value.rows.length+' строк. CSV содержит все строки. Данные не изменены.';$('table-download').disabled=false;}catch(e){$('table-view').replaceChildren();$('table-notice').textContent=e.message;}};
 $('table-select').onchange=()=>{loadedTable=null;$('table-download').disabled=true;$('table-view').replaceChildren();};
 $('table-download').onclick=()=>{if(!loadedTable)return;const url=URL.createObjectURL(new Blob([tableCSV(loadedTable)],{type:'text/csv;charset=utf-8'}));const link=document.createElement('a');link.href=url;link.download=loadedTable.table+'.csv';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);};
-function reviewPlanText(plan){const actions={add:'Будет добавлена новая строка',update:'Будут заполнены пустые поля',skip:'Изменений нет'};return [actions[plan.action]||'Требуется проверка',...(plan.changes||[]).map(item=>item.field+': '+(item.before===''?'[пусто]':item.before)+' → '+item.after),...(plan.warnings||[]).map(value=>'Внимание: '+value)].join('\\n');}
+function reviewPlanText(plan){const actions={add:'Будет добавлена новая строка',update:'Будут заполнены пустые поля',skip:'Изменений нет'};return [actions[plan.action]||'Требуется проверка',...(plan.target?['Лист: '+plan.target.sheet_title+', строка на снимке: '+plan.target.row,...plan.target.cells.map(c=>c.cell+' → '+c.field)]:[]),...(plan.changes||[]).map(item=>item.field+': '+(item.before===''?'[пусто]':item.before)+' → '+item.after),...(plan.warnings||[]).map(value=>'Внимание: '+value)].join('\\n');}
 function suggestedContacts(value){return [...new Set([...(value.contact_suggestions||[]),...(value.enrichment?.contact_suggestions||[])])];}
 let uploadedFacts=null;
 function clearFacts(){uploadedFacts=null;$('proof-file').value='';$('facts-verified').checked=false;$('proof-hint').textContent='Файл JSON до 12 КБ с проверенными фактами. Ключи — прямые ссылки карточек.';}
@@ -760,8 +809,8 @@ async function refreshJobs(){try{const value=await api('/api/jobs');$('scheduler
 
 $('login').onclick=async()=>{try{await api('/api/session',{source:$('source').value});$('notice').textContent='Войдите в открытом браузере и закройте его окно. Пароли и коды вводите только на сайте.';await refresh();}catch(e){$('notice').textContent=e.message;}};
 $('stop').onclick=async()=>{try{await api('/api/stop',{});await refresh();}catch(e){$('notice').textContent=e.message;}};
-async function refresh(){try{const s=await api('/api/status');const names={idle:'Готов к запуску',running:'Идёт сбор',stopping:'Остановка',completed:'Завершён',attention:'Нужна проверка',cancelled:'Остановлен'};$('status').textContent=s.status==='running'&&s.operation==='login'?'Ожидаем входа в браузере':names[s.status]||s.status;const busy=['running','stopping'].includes(s.status);$('start').disabled=busy;$('login').disabled=busy||$('source').value==='telegram-public';$('task').disabled=busy;$('source').disabled=busy;$('stop').disabled=!busy;$('problem').hidden=!s.problem;if(s.problem){$('notice').textContent='';$('problem-title').textContent=s.problem.title;$('problem-text').textContent=s.problem.message;}$('storage-notice').textContent=s.report_warning||(s.restored?'Восстановлен последний отчёт. Просроченные факты нужно проверить заново.':'');const r=s.report||{};latestReport=s.report||null;$('download-report').disabled=!latestReport;if(r.session_status==='saved_unverified')$('notice').textContent=r.message;const counts=r.source_summary||{};for(const [id,key] of [['accepted','accept'],['review','review'],['rejected','reject']])$(id).textContent=counts[key]??'—';$('report').textContent=s.report?JSON.stringify(s.report,null,2):'Нет отчёта';$('error').textContent=s.error||'Нет сообщений';if(s.status==='completed'&&s.report&&!s.report.session_setup){$('notice').textContent='Поиск завершён. '+(s.write?'Разрешённые данные сохранены.':'Режим просмотра: таблицы не изменены.');}const err=(s.error||'')+JSON.stringify(r.source_error||{});if(err.includes('auth_required'))$('notice').textContent='Нужен вход в рабочий аккаунт. Задание не ждёт ввода; восстановите сессию отдельно.';const list=$('results');list.replaceChildren();if(s.report){for(const d of (r.decisions||[])){const row=document.createElement('div');row.className='item';const c=d.candidate||{};const title=document.createElement('strong');title.textContent=c['Название компании']||c['Название']||c['Стример']||d.product_observation?.title||'Кандидат без подтверждённого имени';const info=document.createElement('small');info.textContent=({accept:'Принят',review:'Требует проверки',reject:'Отклонён'}[d.decision]||d.decision)+' · '+((d.reasons||[]).join(' / ')||'Проверки пройдены');row.append(title,info);const facts=document.createElement('small');facts.textContent=[c['Ссылка'],c['Подписчики']!==undefined?c['Подписчики'].toLocaleString()+' подписчиков':'',typeof d.score==='number'?'Score: '+d.score:'',suggestedContacts(d).length?'Контакты для проверки: '+suggestedContacts(d).join(', '):''].filter(Boolean).join(' · ');row.append(facts);const href=candidateLink(c['Ссылка']||c['Сайт']||d.evidence?.url);if(href){const link=document.createElement('a');link.href=href;link.target='_blank';link.rel='noopener noreferrer';link.textContent='Открыть источник';link.style.color='#79e0ba';row.append(link);}if(r.source==='telegram-public'&&d.decision==='review'&&d.placement?.status==='offered'&&(d.contact_suggestions||[]).length){const button=document.createElement('button');button.type='button';button.className='secondary';const reviewed=(r.manual_reviews||[]).some(item=>item.candidate?.['Ссылка']===c['Ссылка']);button.textContent=reviewed?'Проверка выполнена':'Проверить и сохранить';button.disabled=reviewed;button.onclick=()=>openReview(r.decisions.indexOf(d),d);row.append(button);}list.append(row);}if(!(r.decisions||[]).length)list.textContent='Нет принятых или рассмотренных кандидатов.';}}catch(e){$('status').textContent='Панель недоступна';}}
-refresh();refreshJobs();setInterval(refresh,2000);setInterval(refreshJobs,5000);
+async function refresh(){try{const s=await api('/api/status');const names={idle:'Готов к запуску',running:'Идёт сбор',stopping:'Остановка',completed:'Завершён',attention:'Нужна проверка',cancelled:'Остановлен'};$('status').textContent=s.status==='running'&&s.operation==='login'?'Ожидаем входа в браузере':names[s.status]||s.status;const busy=['running','stopping'].includes(s.status);$('start').disabled=busy;$('login').disabled=busy||$('source').value==='telegram-public';$('task').disabled=busy;$('source').disabled=busy;$('stop').disabled=!busy;$('problem').hidden=!s.problem;if(s.problem){$('notice').textContent='';$('problem-title').textContent=s.problem.title;$('problem-text').textContent=s.problem.message;}$('storage-notice').textContent=s.report_warning||(s.restored?'Восстановлен последний отчёт. Просроченные факты нужно проверить заново.':'');const r=s.report||{};latestReport=s.report||null;$('download-report').disabled=!latestReport;if(r.session_status==='saved_unverified')$('notice').textContent=r.message;const counts=r.source_summary||{};for(const [id,key] of [['accepted','accept'],['review','review'],['rejected','reject']])$(id).textContent=counts[key]??'—';$('report').textContent=s.report?JSON.stringify(s.report,null,2):'Нет отчёта';$('error').textContent=s.error||'Нет сообщений';if(s.destination)$('status').textContent+=' · '+s.destination;if(s.status==='completed'&&s.report&&!s.report.session_setup){$('notice').textContent='Поиск завершён. '+(s.write?'Разрешённые данные сохранены.':'Режим просмотра: таблицы не изменены.');}const err=(s.error||'')+JSON.stringify(r.source_error||{});if(err.includes('auth_required'))$('notice').textContent='Нужен вход в рабочий аккаунт. Задание не ждёт ввода; восстановите сессию отдельно.';const list=$('results');list.replaceChildren();if(s.report){for(const d of (r.decisions||[])){const row=document.createElement('div');row.className='item';const c=d.candidate||{};const title=document.createElement('strong');title.textContent=c['Название компании']||c['Название']||c['Стример']||d.product_observation?.title||'Кандидат без подтверждённого имени';const info=document.createElement('small');info.textContent=({accept:'Принят',review:'Требует проверки',reject:'Отклонён'}[d.decision]||d.decision)+' · '+((d.reasons||[]).join(' / ')||'Проверки пройдены');row.append(title,info);const facts=document.createElement('small');facts.textContent=[c['Ссылка'],c['Подписчики']!==undefined?c['Подписчики'].toLocaleString()+' подписчиков':'',typeof d.score==='number'?'Score: '+d.score:'',suggestedContacts(d).length?'Контакты для проверки: '+suggestedContacts(d).join(', '):''].filter(Boolean).join(' · ');row.append(facts);const href=candidateLink(c['Ссылка']||c['Сайт']||d.evidence?.url);if(href){const link=document.createElement('a');link.href=href;link.target='_blank';link.rel='noopener noreferrer';link.textContent='Открыть источник';link.style.color='#79e0ba';row.append(link);}if(r.source==='telegram-public'&&d.decision==='review'&&d.placement?.status==='offered'&&(d.contact_suggestions||[]).length){const button=document.createElement('button');button.type='button';button.className='secondary';const reviewed=(r.manual_reviews||[]).some(item=>item.candidate?.['Ссылка']===c['Ссылка']);button.textContent=reviewed?'Проверка выполнена':'Проверить и сохранить';button.disabled=reviewed;button.onclick=()=>openReview(r.decisions.indexOf(d),d);row.append(button);}list.append(row);}if(!(r.decisions||[]).length)list.textContent='Нет принятых или рассмотренных кандидатов.';}}catch(e){$('status').textContent='Панель недоступна';}}
+refresh();refreshJobs();refreshGoogle();setInterval(refresh,2000);setInterval(refreshJobs,5000);
 </script></html>'''
 
 
@@ -813,6 +862,12 @@ def make_server(controller=None, port=8765):
                     self.send(200, controller.table_snapshot(self.path.removeprefix('/api/tables/')))
                 except (ValueError, StorageError, ValidationError, OSError):
                     self.send(400, {'error': 'Таблицу не удалось прочитать. Проверьте выбранную таблицу, её заголовки и доступ к папке данных.'})
+            elif self.path == '/api/google/status':
+                from safe_writer import StorageError
+                try:
+                    self.send(200,controller.google_status())
+                except (StorageError,OSError):
+                    self.send(400,{'error':'Настройки Google недоступны. Проверьте локальный ключ и подключения.'})
             elif self.path == '/api/jobs':
                 try:
                     self.send(200, {'jobs': scheduler.jobs(), 'error': scheduler.error})
@@ -833,6 +888,17 @@ def make_server(controller=None, port=8765):
                     if scheduler.active is not None:
                         raise ValueError('Дождитесь завершения задания расписания.')
                     controller.start(body)
+                elif self.path in ('/api/google/key','/api/google/attach'):
+                    from safe_writer import StorageError
+                    from validation import ValidationError
+                    if scheduler.active is not None:
+                        raise ValueError('Дождитесь завершения задания расписания.')
+                    try:
+                        result=controller.google_setup(body,credentials=self.path.endswith('/key'))
+                    except (StorageError,ValidationError) as error:
+                        raise ValueError(str(error)) from error
+                    self.send(200,result)
+                    return
                 elif self.path in ('/api/review/preview', '/api/review/commit'):
                     if scheduler.active is not None:
                         raise ValueError('Дождитесь завершения задания расписания.')
