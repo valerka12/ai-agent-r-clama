@@ -7,3 +7,5 @@ python-dotenv==1.2.1
 
 # Браузерный TGStat: отдельный Chromium и ручной вход.
 playwright==1.64.0
+# Авторизация служебного аккаунта Google для приватных подключённых таблиц.
+google-auth[requests]==2.62.0

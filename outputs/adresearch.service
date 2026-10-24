@@ -1,0 +1,22 @@
+[Unit]
+Description=Ad Research Agent autonomous scheduler
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=adresearch
+Group=adresearch
+WorkingDirectory=/opt/adresearch
+Environment=PYTHONUTF8=1
+Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/adresearch/cache/ms-playwright
+ExecStart=/opt/adresearch/.venv/bin/python -m agent --service
+Restart=on-failure
+RestartSec=15
+KillMode=control-group
+TimeoutStopSec=20
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

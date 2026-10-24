@@ -5,10 +5,23 @@
 """
 
 from pathlib import Path
+import os
+import sys
 
 
 # Пути считаются от папки проекта, независимо от места запуска.
-PROJECT_DIR = Path(__file__).resolve().parent
+def _project_dir():
+    if not getattr(sys, "frozen", False):
+        return Path(__file__).resolve().parent
+    # Сборка приложения не записывает данные внутрь .app / Program Files.
+    if sys.platform == "win32":
+        return Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))) / "AdResearchAgent"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "AdResearchAgent"
+    return Path.home() / ".local" / "share" / "AdResearchAgent"
+
+
+PROJECT_DIR = _project_dir()
 
 DATA_DIR = PROJECT_DIR / "data"
 BACKUPS_DIR = PROJECT_DIR / "backups"
