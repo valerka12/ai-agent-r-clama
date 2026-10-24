@@ -73,9 +73,9 @@ def _build_command(options):
     if not isinstance(options, dict):
         raise ValueError('Некорректные параметры.')
     source = options.get('source')
-    _validate_facts(options)
-    if source not in SOURCES:
+    if not isinstance(source, str) or source not in SOURCES:
         raise ValueError('Выберите источник.')
+    _validate_facts(options)
     countries = options.get('countries')
     if not isinstance(countries, list) or not countries or any(c not in ('ru', 'by') for c in countries):
         raise ValueError('Выберите РФ и/или Беларусь.')

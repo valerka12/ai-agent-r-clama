@@ -33,7 +33,7 @@ class PanelCommandTests(unittest.TestCase):
             build_command(self.options(write='true'))
 
     def test_bad_source_country_limit_and_injection_rejected(self):
-        for changes in ({'source': 'shell'}, {'countries': ['us']}, {'limit': True}, {'limit': 100}, {'seed': 'https://www.twitch.tv/example;rm'}):
+        for changes in ({'source': 'shell'}, {'source': []}, {'source': {}}, {'countries': ['us']}, {'limit': True}, {'limit': 100}, {'seed': 'https://www.twitch.tv/example;rm'}):
             value = self.options()
             value.update(changes)
             with self.assertRaises(ValueError):
