@@ -433,6 +433,25 @@ def _google_column(index):
     return result
 
 
+# Явно согласованный внешний шаблон. Внутренние 22 колонки не меняются.
+_ADVERTISER_EXTERNAL_HEADERS = (
+    '№', 'ID клиента', 'Название компании', 'Ниша', 'Контактное лицо',
+    'Должность', 'Тelegram', 'Email', 'Сайт', 'Соцсети', 'Cтрана',
+    'Бюджет на рекламу', 'Формат (TG/Twitch)', 'Целевая аудитория',
+    'Рекламируемый продукт', 'Предыдущий опыт рекламы',
+    'Результаты прошлых размещений', 'Готовность к тесту',
+    'Дата первого контакта', 'Статус клиента', 'Дата последнего контакт',
+    'Менеджер (кто пишет)', 'Общая сумма оплат', 'Комментарий',
+    'Рейтинг клиента (A/B/C)',
+)
+_ADVERTISER_EXTERNAL_ALIASES = {
+    'Номер': '№', 'Страна': 'Cтрана',
+    'Формат (TG/Twitch/Kick)': 'Формат (TG/Twitch)',
+    'Предыдущий опыт': 'Предыдущий опыт рекламы',
+    'Общая сумма оплаты': 'Общая сумма оплат',
+}
+
+
 def _google_snapshot(binding, title, raw, effective, *, formatted=None, formats=None):
     import hashlib,re,math
     if (not isinstance(raw,list) or not isinstance(effective,list) or not raw or not effective
@@ -445,11 +464,14 @@ def _google_snapshot(binding, title, raw, effective, *, formatted=None, formats=
     if len(names) != len(set(names)):
         raise ValidationError('В Google Sheets повторяются заголовки. Запись запрещена.')
     matches = [name for name,schema in _SCHEMAS.items() if set(schema[0]) == set(names)]
-    if len(matches) != 1:
-        raise ValidationError('Заголовки листа должны точно соответствовать одной из структур: 22, 14 или 13 колонок. Названия автоматически не меняются.')
-    table = matches[0]
-    positions = {name:header.index(name) for name in names}
+    external_advertisers = set(names) == set(_ADVERTISER_EXTERNAL_HEADERS)
+    if len(matches) != 1 and not external_advertisers:
+        raise ValidationError('Заголовки листа не соответствуют согласованной схеме или поддерживаемому шаблону рекламодателей. Названия автоматически не меняются.')
+    table = 'advertisers' if external_advertisers else matches[0]
     columns,auto,manual,confirmation,_ = _SCHEMAS[table]
+    positions = ({field:header.index(_ADVERTISER_EXTERNAL_ALIASES.get(field,field))
+                  for field in columns if _ADVERTISER_EXTERNAL_ALIASES.get(field,field) in names}
+                 if external_advertisers else {name:header.index(name) for name in names})
     def text(value):
         if isinstance(value,bool):
             return 'TRUE' if value else 'FALSE'
@@ -460,12 +482,12 @@ def _google_snapshot(binding, title, raw, effective, *, formatted=None, formats=
     for i,values in enumerate(effective[1:],start=1):
         if not isinstance(values,list) or any(v not in ('',None) and (j>=len(header) or header[j]=='') for j,v in enumerate(values)):
             raise ValidationError('На листе есть данные в колонках без заголовков. Нужна проверка структуры.')
-        row = {field:text(values[pos]) if pos<len(values) else '' for field,pos in positions.items()}
-        if not any(value != '' for value in row.values()):
+        row = {field:text(values[positions[field]]) if field in positions and positions[field]<len(values) else '' for field in columns}
+        if not any(value not in ('',None) for value in values):
             continue
         rows.append(row)
         view = formatted[i] if isinstance(formatted,list) and i<len(formatted) else values
-        display.append({field:text(view[pos]) if pos<len(view) else '' for field,pos in positions.items()})
+        display.append({field:text(view[positions[field]]) if field in positions and positions[field]<len(view) else '' for field in columns})
     numbers = [row['Номер'] for row in rows]
     if any(not number.isascii() or not number.isdigit() or int(number)<1 for number in numbers) or len(set(map(int,numbers))) != len(numbers):
         raise ValidationError('Существующие строки должны иметь уникальные положительные номера. Ячейки автоматически не исправляются.')
@@ -478,10 +500,10 @@ def _google_snapshot(binding, title, raw, effective, *, formatted=None, formats=
                 for row in raw if isinstance(row,list) for v in row)
     digest = hashlib.sha256(json.dumps([binding['spreadsheet_id'],binding['sheet_id'],raw,effective],ensure_ascii=False,sort_keys=True).encode('utf-8')).hexdigest()
     return {**binding,'sheet_title':title,'table':table,'rows':rows,'display_rows':display,'raw':raw,
-            'positions':positions,'next_row':max(len(raw),len(effective))+1,'fingerprint':digest,
+            'positions':positions,'column_count':len(header),'next_row':max(len(raw),len(effective))+1,'fingerprint':digest,
             'spill_formula':bool(spill),'formats':formats or {},
-            'mapping':[{'field':field,'column':_google_column(positions[field]),
-                        'mode':'manual' if field in manual else 'confirm' if field in confirmation else 'auto-new-row'} for field in columns]}
+            'mapping':[{'field':field,'column':_google_column(positions[field]) if field in positions else '—',
+                        'mode':'unavailable' if field not in positions else 'manual' if field in manual else 'confirm' if field in confirmation else 'auto-new-row'} for field in columns]}
 
 
 class GoogleSheetsAPI:
@@ -619,6 +641,8 @@ class GoogleSheetWriter(SafeWriter):
             snapshot=self.snapshots[table]
             if snapshot['spill_formula']:
                 raise ValidationError('На листе обнаружены массивные/разливающиеся формулы. Автоматическое добавление остановлено до ручной проверки.')
+            if any(change['field'] not in snapshot['positions'] for change in result['changes']):
+                raise ValidationError('Для поля нет колонки в подключённом листе. Запись остановлена.')
             row=snapshot['next_row']+(self.virtual_adds.get(table,0) if virtual else 0)
             result['target']={'type':'google_sheets','spreadsheet_id':snapshot['spreadsheet_id'],
                               'sheet_id':snapshot['sheet_id'],'sheet_title':snapshot['sheet_title'],'row':row,
@@ -668,7 +692,7 @@ class GoogleSheetWriter(SafeWriter):
             current=self._api().snapshot(self.links[table],table)
             if current['fingerprint']!=planned['fingerprint'] or current['formats']!=planned['formats']:
                 raise StorageError('Лист изменился после планирования. Запись отменена, запросите новый план.')
-            cells=[{} for _ in range(max(planned['positions'].values())+1)]
+            cells=[{} for _ in range(planned['column_count'])]
             numeric=_COUNTERS|_PRICES|{'ERR (%)'}
             for change in result['changes']:
                 field,value=change['field'],change['after']

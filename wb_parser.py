@@ -643,7 +643,7 @@ class VisibleBrowserSource(Source):
         from urllib.parse import urljoin
         response = page.goto(self.catalog_url, wait_until="domcontentloaded", timeout=30000)
         if response is None or response.status >= 400:
-            raise SourceError("Каталог недоступен; автопоиск остановлен.")
+            raise SourceError(f"{self.platform}: каталог недоступен (HTTP {response.status if response is not None else 'нет ответа'}); автопоиск остановлен.")
         if urlsplit(page.url).hostname not in self.hosts:
             raise SourceError("Каталог перенаправил на другой сайт.")
         cards = page.locator(self.catalog_selector)

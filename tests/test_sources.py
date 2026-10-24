@@ -821,6 +821,18 @@ class AllBrowserSourceTests(unittest.TestCase):
 
 
 class BrowserAutomationTests(unittest.TestCase):
+    def test_catalog_http_refusal_preserves_status_and_stops_before_parsing(self):
+        from unittest.mock import MagicMock
+        from wb_parser import WBWebSource
+        for status in (403, 429, 503, None):
+            with self.subTest(status=status):
+                page = MagicMock()
+                page.goto.return_value = None if status is None else MagicMock(status=status)
+                expected = 'нет ответа' if status is None else str(status)
+                with self.assertRaisesRegex(SourceError, 'HTTP ' + expected):
+                    WBWebSource()._discover_urls(page)
+                page.locator.assert_not_called()
+
     def test_live_layout_followers_and_country_are_parsed(self):
         from twitch_parser import TwitchWebSource
         from kick_parser import KickWebSource

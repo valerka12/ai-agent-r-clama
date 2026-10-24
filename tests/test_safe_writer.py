@@ -398,6 +398,55 @@ class GoogleSheetsStorageTests(unittest.TestCase):
         self.assertEqual(result['binding']['sheet_id'],9)
         self.assertEqual(self.client.calls,[])
 
+    def test_external_advertiser_template_maps_without_changing_25_columns(self):
+        from safe_writer import _ADVERTISER_EXTERNAL_HEADERS, _google_snapshot, _atomic_write
+        from copy import deepcopy
+        header=list(_ADVERTISER_EXTERNAL_HEADERS)
+        old=['' for _ in header]
+        for field,value in {'№':1,'ID клиента':'C000001','Название компании':'Старая компания',
+                            'Сайт':'https://old.example.org','Тelegram':'@keep',
+                            'Email':'keep@example.org','Менеджер (кто пишет)':'Не менять',
+                            'Комментарий':'=1+1'}.items():
+            old[header.index(field)]=value
+        self.client.raw=[header,old];self.client.effective=deepcopy(self.client.raw)
+        _atomic_write(self.store._path('bindings.json'),json.dumps({'version':1,'links':{'advertisers':self.link}}).encode())
+        snapshot=_google_snapshot(self.link,'Рекламодатели',self.client.raw,self.client.effective)
+        self.assertEqual(snapshot['table'],'advertisers')
+        self.assertEqual(snapshot['positions']['Страна'],10)
+        self.assertEqual(snapshot['positions']['Номер'],0)
+        self.assertNotIn('Telegram/почта',snapshot['positions'])
+        self.assertEqual(len(snapshot['rows'][0]),22)
+        before=deepcopy(self.client.raw)
+        candidate={'Название компании':'Новая компания','Сайт':'https://new.example.org',
+                   'Страна':'Беларусь','Комментарий':'Нельзя','Telegram/почта':'Нельзя'}
+        writer=self.writer()
+        preview=writer.upsert('advertisers',candidate,dry_run=True)
+        targets={item['field']:item['cell'] for item in preview['target']['cells']}
+        self.assertEqual(targets['Страна'],'K3')
+        result=writer.upsert('advertisers',candidate,dry_run=False)
+        self.assertEqual(result['action'],'add')
+        self.assertEqual(self.client.raw[:2],before)
+        self.assertEqual(len(self.client.calls[0]),25)
+        self.assertEqual(self.client.calls[0][10]['userEnteredValue']['stringValue'],'Беларусь')
+        for field in ('Тelegram','Email','Менеджер (кто пишет)','Комментарий','Должность'):
+            self.assertEqual(self.client.calls[0][header.index(field)],{})
+
+    def test_external_template_is_exact_and_does_not_guess_arbitrary_headers(self):
+        from safe_writer import _ADVERTISER_EXTERNAL_HEADERS, _google_snapshot
+        header=list(reversed(_ADVERTISER_EXTERNAL_HEADERS))
+        result=_google_snapshot(self.link,'Лист',[header],[header])
+        self.assertEqual(result['positions']['Номер'],24)
+        for changed in (header[:-1],header+['Другое'],[h.replace('Cтрана','Страна') for h in header]):
+            with self.assertRaises(ValidationError):
+                _google_snapshot(self.link,'Лист',[changed],[changed])
+
+    def test_external_manual_only_unnumbered_row_blocks_write(self):
+        from safe_writer import _ADVERTISER_EXTERNAL_HEADERS, _google_snapshot
+        header=list(_ADVERTISER_EXTERNAL_HEADERS);row=['' for _ in header]
+        row[header.index('Менеджер (кто пишет)')]='Есть ручная запись'
+        with self.assertRaises(ValidationError):
+            _google_snapshot(self.link,'Лист',[header,row],[header,row])
+
     def test_unknown_credentials_are_rejected_without_disclosing_key(self):
         from safe_writer import GoogleSheetsStore
         store=GoogleSheetsStore(self.google_root)
