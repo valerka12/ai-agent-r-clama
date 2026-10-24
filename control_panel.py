@@ -17,10 +17,63 @@ import config
 SOURCES = ('telegram-public', 'tgstat-web', 'wb-web', 'ozon-web', 'instagram-web', 'youtube-web', 'twitch-web', 'kick-web')
 
 
+def _validate_facts(options):
+    """Файл оператора остаётся набором явных доказательств, а не выводом LLM."""
+    proofs = options.get('proofs')
+    enrich = options.get('enrich_sites', False)
+    if type(enrich) is not bool:
+        raise ValueError('Некорректный режим обогащения сайта.')
+    allowed = {'wb-web': ('wb_parser', 'WBWebSource'), 'ozon-web': ('ozon_parser', 'OzonWebSource'),
+               'instagram-web': ('instagram_parser', 'InstagramWebSource'), 'youtube-web': ('youtube_parser', 'YouTubeWebSource')}
+    if options.get('source') not in allowed:
+        if proofs or enrich:
+            raise ValueError('Проверенные факты и сайт применяются только к рекламодателям.')
+        return
+    if proofs is None or proofs == {}:
+        return
+    if not isinstance(proofs, dict) or len(proofs) > 10 or options.get('facts_verified') is not True:
+        raise ValueError('Нужен файл фактов не более чем для 10 карточек и подтверждение его проверки.')
+    try:
+        if len(json.dumps(proofs, ensure_ascii=False, allow_nan=False).encode('utf-8')) > 12000:
+            raise ValueError('Файл фактов превышает 12 КБ.')
+    except (TypeError, ValueError) as error:
+        raise ValueError('Файл фактов должен быть JSON размером до 12 КБ.') from error
+    from datetime import datetime, timezone
+    from importlib import import_module
+    from validation import validate_url
+    from wb_parser import timestamp
+    module, name = allowed[options['source']]
+    collector = getattr(import_module(module), name)()
+    fields = {'brand', 'country', 'website', 'instagram', 'telegram', 'youtube', 'contact',
+              'last_activity', 'advertising', 'niche', 'agency', 'account_age_days', 'followers', 'micro_niche'}
+    for url, facts in proofs.items():
+        if collector.normalize_url(url) != url:
+            raise ValueError('Ключ фактов должен быть нормализованной ссылкой карточки без параметров и завершающего слеша.')
+        if not isinstance(facts, dict) or not facts or set(facts) - fields:
+            raise ValueError('Неизвестные поля фактов карточки.')
+        for field, fact in facts.items():
+            if (not isinstance(fact, dict) or set(fact) != {'value', 'url', 'checked_at', 'operator_verified'}
+                    or fact['operator_verified'] is not True):
+                raise ValueError('Каждый факт требует value, url, checked_at и operator_verified=true.')
+            validate_url(fact['url'])
+            checked = timestamp(fact['checked_at'])
+            if checked is None or not 0 <= (datetime.now(timezone.utc)-checked).total_seconds() <= config.ACTIVE_WITHIN_DAYS*86400:
+                raise ValueError('Факты должны иметь свежую дату проверки с часовым поясом.')
+            if field in ('agency', 'advertising', 'micro_niche'):
+                if type(fact['value']) is not bool:
+                    raise ValueError('Логический факт должен быть true или false.')
+            elif field in ('followers', 'account_age_days'):
+                if type(fact['value']) is not int or fact['value'] < 0:
+                    raise ValueError('Число подписчиков и возраст — целые неотрицательные числа.')
+            elif not isinstance(fact['value'], str) or not fact['value'].strip():
+                raise ValueError('Текстовое значение факта не должно быть пустым.')
+
+
 def _build_command(options):
     if not isinstance(options, dict):
         raise ValueError('Некорректные параметры.')
     source = options.get('source')
+    _validate_facts(options)
     if source not in SOURCES:
         raise ValueError('Выберите источник.')
     countries = options.get('countries')
@@ -87,6 +140,8 @@ def _build_command(options):
         args += ['--discover']
     else:
         raise ValueError('Для Instagram/YouTube нужны прямые ссылки на профили.')
+    if options.get('enrich_sites'):
+        args.append('--enrich-sites')
     return args
 
 
@@ -124,12 +179,85 @@ def source_access_blocked(error):
 
 
 class Controller:
-    def __init__(self):
+    def __init__(self, report_dir=None):
         self.lock = threading.Lock()
         self.process = None
         self.generation = 0
         self.review_preview = None
         self.state = {'status': 'idle', 'report': None, 'error': '', 'exit_code': None}
+        self.report_dir = None if report_dir is False else Path(report_dir) if report_dir is not None else config.CACHE_DIR / 'reports'
+        self._restore_report()
+
+    def _report_path(self):
+        if self.report_dir is None:
+            return None
+        path = self.report_dir / 'latest.json'
+        if self.report_dir.is_symlink() or self.report_dir.parent.is_symlink() or path.is_symlink():
+            raise OSError('Report symlinks are not supported')
+        return path
+
+    def _restore_report(self):
+        try:
+            path = self._report_path()
+            if path is None or not path.exists():
+                return
+            if path.stat().st_size > 2_000_000:
+                raise ValueError('Report too large')
+            saved = json.loads(path.read_text(encoding='utf-8'))
+            if (not isinstance(saved, dict) or saved.get('version') != 1
+                    or saved.get('status') not in ('completed', 'attention', 'cancelled')
+                    or saved.get('source') not in SOURCES
+                    or type(saved.get('write')) is not bool
+                    or not isinstance(saved.get('error'), str)
+                    or saved.get('report') is not None and not isinstance(saved['report'], dict)
+                    or saved.get('exit_code') is not None and type(saved['exit_code']) is not int):
+                raise ValueError('Invalid report')
+            self.state = {key: saved[key] for key in ('status', 'source', 'write', 'report', 'error', 'exit_code')}
+            self.state.update(operation='search', restored=True)
+        except (OSError, ValueError, KeyError):
+            self.state['report_warning'] = 'Последний отчёт не удалось восстановить. Исходный файл оставлен без изменений.'
+
+    def _persist_report(self):
+        if self.report_dir is None or self.state.get('operation') == 'login':
+            return
+        temporary = None
+        try:
+            path = self._report_path()
+            saved = {key: self.state.get(key) for key in ('status', 'source', 'write', 'report', 'error', 'exit_code')}
+            saved['version'] = 1
+            raw = json.dumps(saved, ensure_ascii=False).encode('utf-8')
+            if len(raw) > 2_000_000:
+                raise ValueError('Report too large')
+            path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary = tempfile.mkstemp(prefix='.report-', dir=path.parent)
+            with os.fdopen(descriptor, 'wb') as stream:
+                stream.write(raw)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+            temporary = None
+            self.state.pop('report_warning', None)
+        except (OSError, ValueError, TypeError):
+            self.state['report_warning'] = 'Отчёт виден в окне, но сохранить его на диск не удалось. Скачайте JSON перед закрытием. Результат записи таблиц от этого не меняется.'
+        finally:
+            if temporary is not None:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+
+    def table_snapshot(self, table, *, writer=None):
+        from safe_writer import SafeWriter
+        columns = {'advertisers': config.ADVERTISER_COLUMNS, 'telegram': config.TELEGRAM_COLUMNS,
+                   'streamers': config.STREAMER_COLUMNS}
+        if table not in columns:
+            raise ValueError('Неизвестная таблица.')
+        storage = writer if writer is not None else SafeWriter()
+        rows = storage.read(table)
+        result = {'table': table, 'columns': list(columns[table]), 'rows': rows}
+        if len(json.dumps(result, ensure_ascii=False).encode('utf-8')) > 2_000_000:
+            raise ValueError('Таблица превышает лимит просмотра 2 МБ. Используйте исходный CSV.')
+        return result
 
     def snapshot(self):
         with self.lock:
@@ -166,7 +294,8 @@ class Controller:
                 storage.log_report({'kind': 'operator_review', 'candidate': candidate, 'proof': proof})
                 result = storage.upsert('telegram', candidate, dry_run=False, confirmed_fields=('Контакт',))
                 report.setdefault('manual_reviews', []).append({'candidate': candidate, 'proof': proof, 'result': result})
-                return {'saved': True, 'result': result}
+                self._persist_report()
+                return {'saved': True, 'result': result, 'report_warning': self.state.get('report_warning')}
             self.review_preview = None
             index = body.get('index')
             decisions = report.get('decisions', [])
@@ -237,18 +366,25 @@ class Controller:
             generation = self.generation
             # Передаются только проверенные аргументы, shell никогда не используется.
             spool = None
-            if getattr(sys, 'frozen', False):
-                config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
-                spool = tempfile.TemporaryDirectory(prefix='desktop-job-', dir=config.CACHE_DIR)
-                args = [sys.executable, '--agent-worker', str(Path(spool.name)/'stdout.txt'),
-                        str(Path(spool.name)/'stderr.txt'), *args[3:]]
             try:
+                if getattr(sys, 'frozen', False) or (not session_setup and options.get('proofs')):
+                    if config.CACHE_DIR.is_symlink():
+                        raise ValueError('Папка кэша не должна быть символьной ссылкой.')
+                    config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                    spool = tempfile.TemporaryDirectory(prefix='desktop-job-', dir=config.CACHE_DIR)
+                if not session_setup and options.get('proofs'):
+                    proof_file = Path(spool.name)/'proofs.json'
+                    proof_file.write_text(json.dumps(options['proofs'], ensure_ascii=False), encoding='utf-8')
+                    args += ['--brand-proofs', str(proof_file)]
+                if getattr(sys, 'frozen', False):
+                    args = [sys.executable, '--agent-worker', str(Path(spool.name)/'stdout.txt'),
+                            str(Path(spool.name)/'stderr.txt'), *args[3:]]
                 self.process = subprocess.Popen(args, cwd=config.PROJECT_DIR, stdin=subprocess.DEVNULL,
                                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                                 env=dict(os.environ, PYTHONIOENCODING='utf-8', PYTHONUTF8='1'),
                                                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
                                                 start_new_session=(os.name == 'posix'))
-            except OSError:
+            except (OSError, ValueError):
                 if spool is not None:
                     spool.cleanup()
                 raise
@@ -322,6 +458,7 @@ class Controller:
                               report=report, error='Превышено время или объём вывода.' if overflow.is_set() else error,
                               exit_code=process.returncode)
             self.process = None
+            self._persist_report()
 
     @staticmethod
     def _terminate(process, force=False):
@@ -392,7 +529,7 @@ class Scheduler:
         if type(interval_seconds) is not int or not 300 <= interval_seconds <= 604800:
             raise ValueError('Интервал: от 5 минут до 7 суток.')
         build_command(options)
-        allowed = {'source', 'countries', 'limit', 'write', 'seed', 'category', 'query'}
+        allowed = {'source', 'countries', 'limit', 'write', 'seed', 'category', 'query', 'proofs', 'facts_verified', 'enrich_sites'}
         if set(options) - allowed:
             raise ValueError('Неизвестные параметры задания.')
         identifier = secrets.token_hex(8)
@@ -575,12 +712,12 @@ HTML = '''<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewp
 <div class="row"><button type="button" id="start">▶ Пуск</button><button type="button" class="secondary" id="stop" disabled>■ Стоп</button></div><p id="task-hint" class="hint">Найдём каналы выбранной тематики и проверим показатели и возможность рекламы.</p>
 <button type="button" class="secondary" id="login">Войти в аккаунт</button><p class="hint" id="login-hint">Для первого входа откроется отдельный браузер. Войдите на сайте и закройте его окно. Программа сохранит сессию.</p>
 <details><summary>Дополнительные настройки</summary><label for="seed">Конкретные каналы или ссылки (необязательно)</label><textarea id="seed" placeholder="@kod_ru или ссылки через пробел"></textarea><p class="hint" id="seed-hint">Если указаны каналы, поиск по тематике не используется.</p>
-<div class="countries"><label><input id="ru" type="checkbox" checked> РФ</label><label><input id="by" type="checkbox" checked> Беларусь</label></div>
+<div id="advertiser-facts" hidden><label>Проверенные факты о рекламодателях (необязательно)</label><input id="proof-file" type="file" accept=".json,application/json"><p id="proof-hint" class="hint">Файл JSON до 12 КБ: ключи — ссылки карточек; факты содержат value, url, checked_at, operator_verified. Без него неполные кандидаты останутся на проверке.</p><label><input id="facts-verified" type="checkbox"> Я проверил факты и источники в файле</label><label><input id="enrich-sites" type="checkbox" checked> Проверять доступность подтверждённого сайта и искать публичные контакты</label><p class="hint">Контакты — предложения. Их наличие не разрешает запись в ручные поля.</p></div><div class="countries"><label><input id="ru" type="checkbox" checked> РФ</label><label><input id="by" type="checkbox" checked> Беларусь</label></div>
 <label class="write"><input id="write" type="checkbox"> Сохранять результат в таблицы</label><p class="hint">По умолчанию — просмотр. Ручные поля и заполненные ячейки защищены.</p>
 <label for="interval">Повторять каждые (минут)</label><input id="interval" type="number" min="5" max="10080" value="60"><button type="button" class="secondary" id="schedule" style="margin-top:12px">Включить расписание</button><p class="hint">Работает, пока приложение или серверный сервис включён.</p></details></form></section>
-<section><h2>Ход выполнения</h2><span id="status" class="badge">Готов к запуску</span><p id="notice" role="alert"></p><div id="problem" hidden style="border:1px solid #bf7653;background:#392820;padding:18px;border-radius:10px;margin-top:20px"><strong id="problem-title"></strong><p id="problem-text"></p></div>
+<section><h2>Ход выполнения</h2><span id="status" class="badge">Готов к запуску</span><p id="notice" role="alert"></p><p id="storage-notice" class="hint" role="status"></p><div id="problem" hidden style="border:1px solid #bf7653;background:#392820;padding:18px;border-radius:10px;margin-top:20px"><strong id="problem-title"></strong><p id="problem-text"></p></div>
 <div class="cards"><div class="metric"><strong id="accepted">—</strong><span>ПОДХОДЯТ</span></div><div class="metric"><strong id="review">—</strong><span>НУЖНА ПРОВЕРКА</span></div><div class="metric"><strong id="rejected">—</strong><span>ОТКЛОНЕНЫ</span></div></div><div id="results"><p class="hint">Выберите задачу и нажмите Пуск.</p></div>
-<section id="review-form" hidden style="margin-top:20px"><h2>Проверка канала</h2><p id="review-title"></p><p class="hint">Укажите проверенные факты. Это личное подтверждение оператора, а не автоматическая проверка источников.</p><label>Страна</label><select id="review-country"><option value="">Выберите</option><option value="ru">РФ</option><option value="by">Беларусь</option></select><label>Источник подтверждения страны</label><input id="review-country-url" type="url" placeholder="https://..."><label>Средний охват публикации</label><input id="review-reach" type="number" min="0" step="1"><label>Источник среднего охвата (не медиана и не рекламный охват)</label><input id="review-reach-url" type="url" placeholder="https://..."><label>Рекламный контакт</label><select id="review-contact"></select><label>Источник предложения рекламы и контакта</label><input id="review-placement-url" type="url" placeholder="https://..."><label><input id="review-verified" type="checkbox"> Я проверил страну, средний охват, предложение рекламы и контакт</label><div class="row"><button id="review-preview" type="button">Показать изменения</button><button id="review-save" type="button" disabled>Сохранить в таблицу</button><button id="review-close" type="button" class="secondary">Закрыть</button></div><pre id="review-plan">Сначала проверьте факты и запросите план.</pre></section><details><summary>Расписание</summary><div id="jobs"></div><p id="scheduler-error" class="hint"></p></details><details><summary>Подробный отчёт</summary><button type="button" id="download-report" class="secondary" disabled>Скачать отчёт JSON</button><pre id="report">Нет задания</pre></details><details><summary>Диагностика</summary><pre id="error">Нет сообщений</pre></details></section></main>
+<section id="review-form" hidden style="margin-top:20px"><h2>Проверка канала</h2><p id="review-title"></p><p class="hint">Укажите проверенные факты. Это личное подтверждение оператора, а не автоматическая проверка источников.</p><label>Страна</label><select id="review-country"><option value="">Выберите</option><option value="ru">РФ</option><option value="by">Беларусь</option></select><label>Источник подтверждения страны</label><input id="review-country-url" type="url" placeholder="https://..."><label>Средний охват публикации</label><input id="review-reach" type="number" min="0" step="1"><label>Источник среднего охвата (не медиана и не рекламный охват)</label><input id="review-reach-url" type="url" placeholder="https://..."><label>Рекламный контакт</label><select id="review-contact"></select><label>Источник предложения рекламы и контакта</label><input id="review-placement-url" type="url" placeholder="https://..."><label><input id="review-verified" type="checkbox"> Я проверил страну, средний охват, предложение рекламы и контакт</label><div class="row"><button id="review-preview" type="button">Показать изменения</button><button id="review-save" type="button" disabled>Сохранить в таблицу</button><button id="review-close" type="button" class="secondary">Закрыть</button></div><pre id="review-plan">Сначала проверьте факты и запросите план.</pre></section><details><summary>Мои таблицы</summary><label>Таблица</label><select id="table-select"><option value="advertisers">Рекламодатели</option><option value="telegram">Telegram-каналы</option><option value="streamers">Стримеры Twitch/Kick</option></select><div class="row"><button type="button" class="secondary" id="table-load">Открыть таблицу</button><button type="button" class="secondary" id="table-download" disabled>Скачать CSV</button></div><p class="hint" id="table-notice">Просмотр и скачивание не меняют данные. Здесь нет удаления и перезаписи ячеек.</p><div id="table-view" style="overflow:auto;max-height:400px"></div></details><details><summary>Расписание</summary><div id="jobs"></div><p id="scheduler-error" class="hint"></p></details><details><summary>Подробный отчёт</summary><button type="button" id="download-report" class="secondary" disabled>Скачать отчёт JSON</button><pre id="report">Нет задания</pre></details><details><summary>Диагностика</summary><pre id="error">Нет сообщений</pre></details></section></main>
 <script>
 const $=id=>document.getElementById(id),token=__TOKEN__;
 let reviewIndex=null,reviewToken=null,reviewSnapshot=null;
@@ -588,19 +725,29 @@ function clearReviewPlan(){reviewToken=null;$('review-save').disabled=true;}
 function openReview(index,decision){reviewIndex=index;reviewSnapshot={candidate_url:decision.candidate['Ссылка'],observed_at:decision.candidate['Последнее обновление']};clearReviewPlan();$('review-form').hidden=false;$('review-title').textContent=decision.candidate['Название'];for(const id of ['review-country','review-country-url','review-reach','review-reach-url','review-placement-url'])$(id).value='';$('review-verified').checked=false;$('review-plan').textContent='Сначала проверьте факты и запросите план.';const select=$('review-contact');select.replaceChildren();for(const contact of decision.contact_suggestions||[]){const option=document.createElement('option');option.value=contact;option.textContent=contact;select.append(option);}}
 for(const id of ['review-country','review-country-url','review-reach','review-reach-url','review-placement-url','review-contact','review-verified'])$(id).oninput=clearReviewPlan;
 $('review-close').onclick=()=>{$('review-form').hidden=true;clearReviewPlan();};
-$('review-preview').onclick=async()=>{clearReviewPlan();try{const reach=$('review-reach').value.trim();if(!/^[0-9]+$/.test(reach))throw Error('Введите целое неотрицательное число среднего охвата.');const r=await api('/api/review/preview',{...reviewSnapshot,index:reviewIndex,country:$('review-country').value,country_url:$('review-country-url').value,reach:Number(reach),reach_url:$('review-reach-url').value,placement_url:$('review-placement-url').value,contact:$('review-contact').value,verified:$('review-verified').checked});$('review-plan').textContent=JSON.stringify(r.plan,null,2);reviewToken=r.token;$('review-save').disabled=false;}catch(e){$('review-plan').textContent=e.message;}};
-$('review-save').onclick=async()=>{const token=reviewToken;clearReviewPlan();try{const r=await api('/api/review/commit',{token});$('review-plan').textContent=JSON.stringify(r.result,null,2);$('notice').textContent='Проверенный канал обработан. Ручные и заполненные поля защищены.';}catch(e){$('review-plan').textContent=e.message;}};
+$('review-preview').onclick=async()=>{clearReviewPlan();try{const reach=$('review-reach').value.trim();if(!/^[0-9]+$/.test(reach))throw Error('Введите целое неотрицательное число среднего охвата.');const r=await api('/api/review/preview',{...reviewSnapshot,index:reviewIndex,country:$('review-country').value,country_url:$('review-country-url').value,reach:Number(reach),reach_url:$('review-reach-url').value,placement_url:$('review-placement-url').value,contact:$('review-contact').value,verified:$('review-verified').checked});$('review-plan').textContent=reviewPlanText(r.plan);reviewToken=r.token;$('review-save').disabled=false;}catch(e){$('review-plan').textContent=e.message;}};
+$('review-save').onclick=async()=>{const token=reviewToken;clearReviewPlan();try{const r=await api('/api/review/commit',{token});$('review-plan').textContent='Обработано.\\n'+reviewPlanText(r.result);$('notice').textContent='Проверенный канал обработан. Ручные и заполненные поля защищены.';}catch(e){$('review-plan').textContent=e.message;}};
+let loadedTable=null;
+function tableCSV(value){return '\ufeff'+[value.columns,...value.rows.map(row=>value.columns.map(column=>row[column]??''))].map(row=>row.map(cell=>'"'+String(cell).replaceAll('"','""')+'"').join(',')).join('\\r\\n')+'\\r\\n';}
+$('table-load').onclick=async()=>{loadedTable=null;$('table-download').disabled=true;try{const value=await api('/api/tables/'+$('table-select').value);loadedTable=value;const table=document.createElement('table');table.style.borderCollapse='collapse';for(const cells of [value.columns,...value.rows.slice(0,100).map(row=>value.columns.map(c=>row[c]))]){const tr=document.createElement('tr');for(const cell of cells){const td=document.createElement('td');td.textContent=cell??'';td.style.cssText='border:1px solid #455464;padding:8px;white-space:pre-wrap;min-width:110px';tr.append(td);}table.append(tr);}$('table-view').replaceChildren(table);$('table-notice').textContent='Показано '+Math.min(value.rows.length,100)+' из '+value.rows.length+' строк. CSV содержит все строки. Данные не изменены.';$('table-download').disabled=false;}catch(e){$('table-view').replaceChildren();$('table-notice').textContent=e.message;}};
+$('table-select').onchange=()=>{loadedTable=null;$('table-download').disabled=true;$('table-view').replaceChildren();};
+$('table-download').onclick=()=>{if(!loadedTable)return;const url=URL.createObjectURL(new Blob([tableCSV(loadedTable)],{type:'text/csv;charset=utf-8'}));const link=document.createElement('a');link.href=url;link.download=loadedTable.table+'.csv';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);};
+function reviewPlanText(plan){const actions={add:'Будет добавлена новая строка',update:'Будут заполнены пустые поля',skip:'Изменений нет'};return [actions[plan.action]||'Требуется проверка',...(plan.changes||[]).map(item=>item.field+': '+(item.before===''?'[пусто]':item.before)+' → '+item.after),...(plan.warnings||[]).map(value=>'Внимание: '+value)].join('\\n');}
+function suggestedContacts(value){return [...new Set([...(value.contact_suggestions||[]),...(value.enrichment?.contact_suggestions||[])])];}
+let uploadedFacts=null;
+function clearFacts(){uploadedFacts=null;$('proof-file').value='';$('facts-verified').checked=false;$('proof-hint').textContent='Файл JSON до 12 КБ с проверенными фактами. Ключи — прямые ссылки карточек.';}
+$('proof-file').onchange=async()=>{uploadedFacts=null;$('facts-verified').checked=false;try{const file=$('proof-file').files[0];if(!file)return;if(file.size>12000)throw Error('Файл больше 12 КБ.');const value=JSON.parse(await file.text());if(!value||Array.isArray(value)||typeof value!=='object')throw Error('Нужен JSON-объект с ключами-ссылками.');uploadedFacts=value;$('proof-hint').textContent='Загружено карточек: '+Object.keys(value).length+'. Проверьте файл и отметьте подтверждение.';}catch(e){$('proof-hint').textContent=e.message;}};
 let latestReport=null;
 function candidateLink(value){try{const url=new URL(value);if(!['https:','http:'].includes(url.protocol)||url.username||url.password)return null;return url.href;}catch{return null;}}
 $('download-report').onclick=()=>{if(!latestReport)return;const blob=new Blob([JSON.stringify(latestReport,null,2)],{type:'application/json;charset=utf-8'});const url=URL.createObjectURL(blob);const link=document.createElement('a');link.href=url;link.download='agent-report.json';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);};
 const groups={telegram:['telegram-public','tgstat-web'],advertisers:['wb-web','ozon-web','instagram-web','youtube-web'],streamers:['twitch-web','kick-web']};
-function updateSource(){const source=$('source').value;const publicSource=source==='telegram-public';$('public-query').hidden=!publicSource;$('write').disabled=publicSource;if(publicSource)$('write').checked=false;$('login').disabled=publicSource;$('login-hint').textContent=publicSource?'Этот источник работает без аккаунта. Найденные каналы требуют проверки страны и охвата.':'Войдите на сайте в отдельном браузере и закройте его окно. Сессия сохранится.';$('tg').hidden=source!=='tgstat-web';const direct=['instagram-web','youtube-web'].includes(source);$('seed').required=direct;if(direct)$('seed').closest('details').open=true;$('seed-hint').textContent=direct?'Для этой платформы нужны прямые ссылки на профили. Самостоятельный поиск ещё не реализован.':['tgstat-web','telegram-public'].includes(source)?'Конкретные каналы имеют приоритет над поисковой фразой и тематикой.':'Можно оставить пустым — программа выберет карточки из каталога.';$('task-hint').textContent=$('task').value==='telegram'?(publicSource?'Найдём кандидатов. Страна, средний охват и возможность рекламы пока не подтверждены.':'Проверим каналы, охваты и возможность размещения рекламы.'):$('task').value==='advertisers'?'Соберём кандидатов. Без подтверждённых фактов бренд останется на проверке.':'Проверим профили стримеров. Неподтверждённые показатели останутся пустыми.';}
-$('task').onchange=()=>{const allowed=groups[$('task').value];for(const option of $('source').options){option.hidden=!allowed.includes(option.value);option.disabled=option.hidden;}$('source').value=allowed[0];$('seed').value='';updateSource();};
+function updateSource(){const source=$('source').value;const publicSource=source==='telegram-public';$('advertiser-facts').hidden=$('task').value!=='advertisers';$('public-query').hidden=!publicSource;$('write').disabled=publicSource;if(publicSource)$('write').checked=false;$('login').disabled=publicSource;$('login-hint').textContent=publicSource?'Этот источник работает без аккаунта. Найденные каналы требуют проверки страны и охвата.':'Войдите на сайте в отдельном браузере и закройте его окно. Сессия сохранится.';$('tg').hidden=source!=='tgstat-web';const direct=['instagram-web','youtube-web'].includes(source);$('seed').required=direct;if(direct)$('seed').closest('details').open=true;$('seed-hint').textContent=direct?'Для этой платформы нужны прямые ссылки на профили. Самостоятельный поиск ещё не реализован.':['tgstat-web','telegram-public'].includes(source)?'Конкретные каналы имеют приоритет над поисковой фразой и тематикой.':'Можно оставить пустым — программа выберет карточки из каталога.';$('task-hint').textContent=$('task').value==='telegram'?(publicSource?'Найдём кандидатов. Страна, средний охват и возможность рекламы пока не подтверждены.':'Проверим каналы, охваты и возможность размещения рекламы.'):$('task').value==='advertisers'?'Соберём кандидатов. Без подтверждённых фактов бренд останется на проверке.':'Проверим профили стримеров. Неподтверждённые показатели останутся пустыми.';}
+$('task').onchange=()=>{const allowed=groups[$('task').value];for(const option of $('source').options){option.hidden=!allowed.includes(option.value);option.disabled=option.hidden;}$('source').value=allowed[0];$('seed').value='';clearFacts();updateSource();};
 $('topic').onchange=()=>{$('category').hidden=!!$('topic').value;};
-$('source').onchange=updateSource;
+$('source').onchange=()=>{clearFacts();updateSource();};
 $('task').onchange();
 async function api(path,data){const r=await fetch(path,{method:data?'POST':'GET',headers:{'Content-Type':'application/json','X-Control-Token':token},body:data?JSON.stringify(data):undefined});const value=await r.json();if(!r.ok)throw Error(value.error||'Ошибка запроса');return value;}
-function options(){return {source:$('source').value,seed:$('seed').value,category:$('seed').value.trim()?'':($('topic').value||$('category').value),query:$('query').value,countries:['ru','by'].filter(x=>$(x).checked),limit:Number($('limit').value),write:$('write').checked};}
+function options(){return {source:$('source').value,seed:$('seed').value,category:$('seed').value.trim()?'':($('topic').value||$('category').value),query:$('query').value,countries:['ru','by'].filter(x=>$(x).checked),limit:Number($('limit').value),write:$('write').checked,proofs:$('task').value==='advertisers'?uploadedFacts:null,facts_verified:$('facts-verified').checked,enrich_sites:$('task').value==='advertisers'&&$('enrich-sites').checked};}
 $('form').onsubmit=e=>e.preventDefault();
 $('start').onclick=async e=>{e.preventDefault();if(!$('form').reportValidity())return;$('notice').textContent='';try{await api('/api/start',options());await refresh();}catch(e){$('notice').textContent=e.message;}};
 $('schedule').onclick=async()=>{try{await api('/api/jobs/add',{options:options(),interval_seconds:Number($('interval').value)*60});$('notice').textContent='Задание сохранено. Первый запуск начнётся автоматически.';await refreshJobs();}catch(e){$('notice').textContent=e.message;}};
@@ -608,7 +755,7 @@ async function refreshJobs(){try{const value=await api('/api/jobs');$('scheduler
 
 $('login').onclick=async()=>{try{await api('/api/session',{source:$('source').value});$('notice').textContent='Войдите в открытом браузере и закройте его окно. Пароли и коды вводите только на сайте.';await refresh();}catch(e){$('notice').textContent=e.message;}};
 $('stop').onclick=async()=>{try{await api('/api/stop',{});await refresh();}catch(e){$('notice').textContent=e.message;}};
-async function refresh(){try{const s=await api('/api/status');const names={idle:'Готов к запуску',running:'Идёт сбор',stopping:'Остановка',completed:'Завершён',attention:'Нужна проверка',cancelled:'Остановлен'};$('status').textContent=s.status==='running'&&s.operation==='login'?'Ожидаем входа в браузере':names[s.status]||s.status;const busy=['running','stopping'].includes(s.status);$('start').disabled=busy;$('login').disabled=busy||$('source').value==='telegram-public';$('task').disabled=busy;$('source').disabled=busy;$('stop').disabled=!busy;$('problem').hidden=!s.problem;if(s.problem){$('notice').textContent='';$('problem-title').textContent=s.problem.title;$('problem-text').textContent=s.problem.message;}const r=s.report||{};latestReport=s.report||null;$('download-report').disabled=!latestReport;if(r.session_status==='saved_unverified')$('notice').textContent=r.message;const counts=r.source_summary||{};for(const [id,key] of [['accepted','accept'],['review','review'],['rejected','reject']])$(id).textContent=counts[key]??'—';$('report').textContent=s.report?JSON.stringify(s.report,null,2):'Нет отчёта';$('error').textContent=s.error||'Нет сообщений';if(s.status==='completed'&&s.report&&!s.report.session_setup){$('notice').textContent='Поиск завершён. '+(s.write?'Разрешённые данные сохранены.':'Режим просмотра: таблицы не изменены.');}const err=(s.error||'')+JSON.stringify(r.source_error||{});if(err.includes('auth_required'))$('notice').textContent='Нужен вход в рабочий аккаунт. Задание не ждёт ввода; восстановите сессию отдельно.';const list=$('results');list.replaceChildren();if(s.report){for(const d of (r.decisions||[])){const row=document.createElement('div');row.className='item';const c=d.candidate||{};const title=document.createElement('strong');title.textContent=c['Название компании']||c['Название']||c['Стример']||d.product_observation?.title||'Кандидат без подтверждённого имени';const info=document.createElement('small');info.textContent=({accept:'Принят',review:'Требует проверки',reject:'Отклонён'}[d.decision]||d.decision)+' · '+((d.reasons||[]).join(' / ')||'Проверки пройдены');row.append(title,info);const facts=document.createElement('small');facts.textContent=[c['Ссылка'],c['Подписчики']!==undefined?c['Подписчики'].toLocaleString()+' подписчиков':'',(d.contact_suggestions||[]).length?'Контакты для проверки: '+d.contact_suggestions.join(', '):''].filter(Boolean).join(' · ');row.append(facts);const href=candidateLink(c['Ссылка']||c['Сайт']||d.evidence?.url);if(href){const link=document.createElement('a');link.href=href;link.target='_blank';link.rel='noopener noreferrer';link.textContent='Открыть источник';link.style.color='#79e0ba';row.append(link);}if(r.source==='telegram-public'&&d.decision==='review'&&d.placement?.status==='offered'&&(d.contact_suggestions||[]).length){const button=document.createElement('button');button.type='button';button.className='secondary';const reviewed=(r.manual_reviews||[]).some(item=>item.candidate?.['Ссылка']===c['Ссылка']);button.textContent=reviewed?'Проверка выполнена':'Проверить и сохранить';button.disabled=reviewed;button.onclick=()=>openReview(r.decisions.indexOf(d),d);row.append(button);}list.append(row);}if(!(r.decisions||[]).length)list.textContent='Нет принятых или рассмотренных кандидатов.';}}catch(e){$('status').textContent='Панель недоступна';}}
+async function refresh(){try{const s=await api('/api/status');const names={idle:'Готов к запуску',running:'Идёт сбор',stopping:'Остановка',completed:'Завершён',attention:'Нужна проверка',cancelled:'Остановлен'};$('status').textContent=s.status==='running'&&s.operation==='login'?'Ожидаем входа в браузере':names[s.status]||s.status;const busy=['running','stopping'].includes(s.status);$('start').disabled=busy;$('login').disabled=busy||$('source').value==='telegram-public';$('task').disabled=busy;$('source').disabled=busy;$('stop').disabled=!busy;$('problem').hidden=!s.problem;if(s.problem){$('notice').textContent='';$('problem-title').textContent=s.problem.title;$('problem-text').textContent=s.problem.message;}$('storage-notice').textContent=s.report_warning||(s.restored?'Восстановлен последний отчёт. Просроченные факты нужно проверить заново.':'');const r=s.report||{};latestReport=s.report||null;$('download-report').disabled=!latestReport;if(r.session_status==='saved_unverified')$('notice').textContent=r.message;const counts=r.source_summary||{};for(const [id,key] of [['accepted','accept'],['review','review'],['rejected','reject']])$(id).textContent=counts[key]??'—';$('report').textContent=s.report?JSON.stringify(s.report,null,2):'Нет отчёта';$('error').textContent=s.error||'Нет сообщений';if(s.status==='completed'&&s.report&&!s.report.session_setup){$('notice').textContent='Поиск завершён. '+(s.write?'Разрешённые данные сохранены.':'Режим просмотра: таблицы не изменены.');}const err=(s.error||'')+JSON.stringify(r.source_error||{});if(err.includes('auth_required'))$('notice').textContent='Нужен вход в рабочий аккаунт. Задание не ждёт ввода; восстановите сессию отдельно.';const list=$('results');list.replaceChildren();if(s.report){for(const d of (r.decisions||[])){const row=document.createElement('div');row.className='item';const c=d.candidate||{};const title=document.createElement('strong');title.textContent=c['Название компании']||c['Название']||c['Стример']||d.product_observation?.title||'Кандидат без подтверждённого имени';const info=document.createElement('small');info.textContent=({accept:'Принят',review:'Требует проверки',reject:'Отклонён'}[d.decision]||d.decision)+' · '+((d.reasons||[]).join(' / ')||'Проверки пройдены');row.append(title,info);const facts=document.createElement('small');facts.textContent=[c['Ссылка'],c['Подписчики']!==undefined?c['Подписчики'].toLocaleString()+' подписчиков':'',typeof d.score==='number'?'Score: '+d.score:'',suggestedContacts(d).length?'Контакты для проверки: '+suggestedContacts(d).join(', '):''].filter(Boolean).join(' · ');row.append(facts);const href=candidateLink(c['Ссылка']||c['Сайт']||d.evidence?.url);if(href){const link=document.createElement('a');link.href=href;link.target='_blank';link.rel='noopener noreferrer';link.textContent='Открыть источник';link.style.color='#79e0ba';row.append(link);}if(r.source==='telegram-public'&&d.decision==='review'&&d.placement?.status==='offered'&&(d.contact_suggestions||[]).length){const button=document.createElement('button');button.type='button';button.className='secondary';const reviewed=(r.manual_reviews||[]).some(item=>item.candidate?.['Ссылка']===c['Ссылка']);button.textContent=reviewed?'Проверка выполнена':'Проверить и сохранить';button.disabled=reviewed;button.onclick=()=>openReview(r.decisions.indexOf(d),d);row.append(button);}list.append(row);}if(!(r.decisions||[]).length)list.textContent='Нет принятых или рассмотренных кандидатов.';}}catch(e){$('status').textContent='Панель недоступна';}}
 refresh();refreshJobs();setInterval(refresh,2000);setInterval(refreshJobs,5000);
 </script></html>'''
 
@@ -654,6 +801,13 @@ def make_server(controller=None, port=8765):
                 self.send(200, HTML.replace('__TOKEN__', json.dumps(token)), html=True)
             elif self.path == '/api/status':
                 self.send(200, controller.snapshot())
+            elif self.path.startswith('/api/tables/'):
+                from safe_writer import StorageError
+                from validation import ValidationError
+                try:
+                    self.send(200, controller.table_snapshot(self.path.removeprefix('/api/tables/')))
+                except (ValueError, StorageError, ValidationError, OSError):
+                    self.send(400, {'error': 'Таблицу не удалось прочитать. Проверьте выбранную таблицу, её заголовки и доступ к папке данных.'})
             elif self.path == '/api/jobs':
                 try:
                     self.send(200, {'jobs': scheduler.jobs(), 'error': scheduler.error})

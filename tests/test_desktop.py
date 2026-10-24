@@ -48,6 +48,7 @@ class DesktopTests(unittest.TestCase):
 
     def test_window_does_not_open_external_browser_and_closes_server(self):
         gui = MagicMock()
+        gui.settings = {}
         server = MagicMock()
         server.server_port = 12345
         controller = MagicMock()
@@ -55,6 +56,7 @@ class DesktopTests(unittest.TestCase):
         with patch.dict(sys.modules, {'webview': gui}), patch('desktop.prepare_runtime'), patch('control_panel.Controller', return_value=controller), patch('control_panel.make_server', return_value=server) as make, patch('webbrowser.open', side_effect=AssertionError('external browser forbidden')):
             self.assertEqual(main([]), 0)
         self.assertEqual(make.call_args.kwargs['port'], 0)
+        self.assertTrue(gui.settings["ALLOW_DOWNLOADS"])
         gui.create_window.assert_called_once()
         gui.start.assert_called_once_with(debug=False, private_mode=True)
         controller.stop.assert_called_once()

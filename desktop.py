@@ -76,6 +76,7 @@ def main(argv=None):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
+        webview.settings['ALLOW_DOWNLOADS'] = True
         webview.create_window('Агент · Реклама', f'http://127.0.0.1:{server.server_port}/',
                               width=1180, height=820, min_size=(760, 620), background_color='#101419')
         # Системный WebKit на Mac / WebView2 на Windows, без открытия внешнего браузера.

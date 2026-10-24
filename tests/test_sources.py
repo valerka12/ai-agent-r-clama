@@ -1396,3 +1396,37 @@ class AdvertiserBrandObservationTests(unittest.TestCase):
             self.assertEqual(report['source_summary']['review'],1)
             self.assertEqual(report['summary']['added'],0)
             self.assertFalse(root.exists())
+
+
+class BrowserAdvertiserEnrichmentTests(unittest.TestCase):
+    def inputs(self):
+        product, facts = brand_data()
+        url = 'https://www.wildberries.ru/catalog/123/detail.aspx'
+        facts['brand']['url'] = url
+        capture = {'url':url,'title':'Товар','text':product['brand'],
+                   'product_metrics':{'reviewRating':4.9,'feedbacks':1000},
+                   'observed_at':datetime.now(timezone.utc).isoformat()}
+        return capture,{url:facts}
+
+    def test_site_failure_downgrades_candidate_and_prevents_write(self):
+        capture,proofs = self.inputs()
+        with tempfile.TemporaryDirectory() as folder,patch('wb_parser.enrich_website',side_effect=SourceError('HTTP 403')):
+            root = Path(folder)/'storage'
+            report = run_source('wb-web',payload={'captures':[capture]},proofs=proofs,enrich_sites=True,
+                                dry_run=False,writer=SafeWriter(root))
+            self.assertEqual(report['source_summary']['accept'],0)
+            self.assertEqual(report['source_summary']['review'],1)
+            self.assertFalse((root/'data/advertisers.csv').exists())
+
+    def test_site_contacts_are_suggestions_and_manual_fields_are_not_written(self):
+        capture,proofs = self.inputs()
+        with tempfile.TemporaryDirectory() as folder,patch('wb_parser.enrich_website',return_value={'contact_suggestions':['sales@example.org'],'operator_verified':False}) as enrich:
+            writer = SafeWriter(Path(folder))
+            report = run_source('wb-web',payload={'captures':[capture]},proofs=proofs,enrich_sites=True,
+                                dry_run=False,writer=writer)
+            enrich.assert_called_once()
+            self.assertEqual(report['source_summary']['accept'],1)
+            row = writer.read('advertisers')[0]
+            self.assertEqual(row['Telegram/почта'],'')
+            self.assertEqual(row['Комментарий'],'')
+            self.assertEqual(report['decisions'][0]['enrichment']['contact_suggestions'],['sales@example.org'])

@@ -168,6 +168,18 @@ def run_source(source_name, *, writer=None, dry_run=True, payload=None,
         except BrowserBatchError as error:
             decisions = error.decisions
             source_failure = {"reason": str(error), "collected": len(decisions), "write_blocked": True}
+        if table == 'advertisers' and enrich_sites:
+            for decision in decisions:
+                candidate = decision.get('candidate', {})
+                site, brand = candidate.get('Сайт'), candidate.get('Название компании')
+                if site and brand:
+                    try:
+                        decision['enrichment'] = enrich_website(brand, site)
+                    except (SourceError, ValidationError) as error:
+                        decision['enrichment'] = {'warning': str(error)}
+                        if decision['decision'] == 'accept':
+                            decision['decision'] = 'review'
+                            decision['reasons'].append('Живая проверка официального сайта не выполнена.')
     else:
         raise ValidationError("Неизвестный источник.")
     accepted = [(index, decision["candidate"]) for index, decision in enumerate(decisions)
@@ -273,8 +285,10 @@ def main(argv=None):
     if args.urls and not generic_browser:
         parser.error("--urls требует wb/ozon/instagram/youtube/twitch/kick-web.")
     if generic_browser and (args.wb_file or args.tg_file or args.query or args.category
-                            or args.allow_unofficial_wb or args.enrich_sites or tg_filters):
+                            or args.allow_unofficial_wb or tg_filters):
         parser.error("Браузерный источник принимает --urls либо --web-file, --brand-proofs и --countries.")
+    if args.enrich_sites and args.source in {'twitch-web', 'kick-web'}:
+        parser.error('Проверка сайта применяется только к рекламодателям.')
     if args.source == "wb" and (args.tg_file or args.category or tg_filters):
         parser.error("--tg-file и --category предназначены только для tgstat.")
     if args.source == "tgstat" and (args.wb_file or args.brand_proofs or args.niche

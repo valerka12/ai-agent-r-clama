@@ -62,7 +62,7 @@ class PanelHTTPTests(unittest.TestCase):
         cache = patch('config.CACHE_DIR', Path(temporary.name)/'cache')
         cache.start()
         self.addCleanup(cache.stop)
-        self.controller = Controller()
+        self.controller = Controller(report_dir=False)
         self.server = make_server(self.controller, port=0)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -101,13 +101,33 @@ class PanelHTTPTests(unittest.TestCase):
             spawn.assert_not_called()
 
 
+    def test_tables_require_local_token_and_do_not_create_storage(self):
+        import tempfile,re
+        from pathlib import Path
+        from safe_writer import SafeWriter
+        _,html = self.request('/')
+        token = re.search(r'token="([A-Za-z0-9_-]+)"',html)[1]
+        self.assertEqual(self.request('/api/tables/telegram')[0],403)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)/'storage'
+            storage = SafeWriter(root)
+            with patch('safe_writer.SafeWriter',return_value=storage):
+                status,raw = self.request('/api/tables/telegram',**{'X-Control-Token':token})
+                self.assertEqual(status,200)
+                result = json.loads(raw)
+                self.assertEqual(len(result['columns']),14)
+                self.assertEqual(result['rows'],[])
+                self.assertEqual(self.request('/api/tables/unknown',**{'X-Control-Token':token})[0],400)
+            self.assertFalse(root.exists())
+
+
 class PanelControllerTests(unittest.TestCase):
     def test_process_runs_without_shell_and_report_is_collected(self):
         process = MagicMock()
         process.stdout = io.BytesIO(b'{"status":"completed","summary":{"total":0}}')
         process.stderr = io.BytesIO(b'')
         process.returncode = 0
-        controller = Controller()
+        controller = Controller(report_dir=False)
         with patch('control_panel.subprocess.Popen', return_value=process) as spawn:
             controller.start(dict(source='twitch-web', countries=['ru'], limit=1))
             for _ in range(100):
@@ -125,7 +145,7 @@ class PanelControllerTests(unittest.TestCase):
         process.stdout = io.BytesIO(b'{"status":"completed","session_status":"saved_unverified"}')
         process.stderr = io.BytesIO(b'')
         process.returncode = 0
-        controller = Controller()
+        controller = Controller(report_dir=False)
         with patch('control_panel.subprocess.Popen', return_value=process) as spawn:
             controller.start({'source': 'tgstat-web'}, session_setup=True)
             for _ in range(100):
@@ -138,7 +158,7 @@ class PanelControllerTests(unittest.TestCase):
         self.assertNotIn('--source', args)
 
     def test_parallel_start_rejected(self):
-        controller = Controller()
+        controller = Controller(report_dir=False)
         controller.state['status'] = 'running'
         with self.assertRaises(ValueError):
             controller.start(dict(source='twitch-web', countries=['ru'], limit=1))
@@ -157,7 +177,7 @@ class FailureExplanationTests(unittest.TestCase):
         self.assertIsNone(explain_failure(''))
 
     def test_partial_source_error_appears_in_status(self):
-        controller = Controller()
+        controller = Controller(report_dir=False)
         controller.state.update(report={'source_error': {'reason': 'HTTP 403'}})
         self.assertEqual(controller.snapshot()['problem']['title'], 'Сайт запретил доступ')
 
@@ -391,6 +411,9 @@ global.setInterval=()=>{};
 """
         verification = r"""
 (async()=>{await document.getElementById('form').onsubmit({preventDefault(){}});assert.equal(starts,0);await document.getElementById('start').onclick({preventDefault(){}});assert.equal(starts,1);
+const exported=tableCSV({columns:['Колонка'],rows:[{'Колонка':'a,"b"'+String.fromCharCode(10)+'строка'}]});assert.equal(exported.charCodeAt(0),65279);assert.ok(exported.includes('""b""'));assert.ok(exported.endsWith(String.fromCharCode(13,10)));
+assert.deepEqual(suggestedContacts({contact_suggestions:[],enrichment:{contact_suggestions:['sales@example.org']}}),['sales@example.org']);
+assert.ok(reviewPlanText({action:'update',changes:[{field:'Контакт',before:'',after:'@manager'}]}).includes('Контакт: [пусто] → @manager'));
 assert.equal(candidateLink('javascript:alert(1)'),null);
 assert.equal(candidateLink('https://user:password@example.com'),null);
 assert.equal(candidateLink('not a link'),null);
@@ -403,6 +426,11 @@ URL.revokeObjectURL=url=>{revoked=url;};global.setTimeout=fn=>fn();
 const originalCreate=document.createElement;document.createElement=tag=>tag==='a'?{click(){download={href:this.href,name:this.download};}}:originalCreate(tag);
 latestReport={source:'telegram-public',decisions:[]};document.getElementById('download-report').onclick();
 assert.deepEqual(download,{href:'blob:test',name:'agent-report.json'});assert.equal(revoked,'blob:test');
+document.getElementById('task').value='advertisers';document.getElementById('source').value='wb-web';
+const fileFacts={'https://www.wildberries.ru/catalog/123/detail.aspx':{brand:{value:'Example',operator_verified:true}}};
+document.getElementById('proof-file').files=[{size:100,text:async()=>JSON.stringify(fileFacts)}];
+await document.getElementById('proof-file').onchange();assert.deepEqual(uploadedFacts,fileFacts);assert.equal(document.getElementById('facts-verified').checked,false);
+document.getElementById('facts-verified').checked=true;assert.deepEqual(options().proofs,fileFacts);clearFacts();assert.equal(uploadedFacts,null);
 const reviewRequests=[];global.fetch=async(path,opts)=>{reviewRequests.push([path,JSON.parse(opts.body)]);return {ok:true,json:async()=>path.endsWith('/preview')?{token:'review-token',plan:{action:'add'}}:{saved:true,result:{action:'add'}}};};
 openReview(0,{candidate:{'Название':'Канал'},contact_suggestions:['@ad_manager']});
 for(const [id,value] of Object.entries({'review-country':'ru','review-country-url':'https://example.org/geo','review-reach':'500','review-reach-url':'https://example.org/stat','review-placement-url':'https://t.me/example_channel','review-contact':'@ad_manager'}))document.getElementById(id).value=value;
@@ -431,7 +459,7 @@ class PublicSearchPanelTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_command(dict(source='telegram-public',countries=['ru'],limit=1,write=True))
         with self.assertRaises(ValueError):
-            Controller().start({'source':'telegram-public'},session_setup=True)
+            Controller(report_dir=False).start({'source':'telegram-public'},session_setup=True)
 
     def test_direct_channels_take_precedence_over_query(self):
         args = build_command(dict(source='telegram-public',countries=['by'],limit=1,query='Беларусь',seed='@devby'))
@@ -459,7 +487,7 @@ class TelegramOperatorReviewTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)/'storage'
         self.writer = SafeWriter(self.root)
-        self.controller = Controller()
+        self.controller = Controller(report_dir=False)
         self.candidate = {'Название':'Проверяемый канал','Ссылка':'https://t.me/example_channel',
                           'Подписчики':2000,'Последнее обновление':datetime.now(timezone.utc).isoformat()}
         self.controller.state = {'status':'completed','report':{'source':'telegram-public','decisions':[
@@ -608,3 +636,172 @@ class TelegramOperatorReviewTests(unittest.TestCase):
                 self.assertEqual(self.writer.read('telegram')[0]['Контакт'],'@ad_manager')
             finally:
                 server.shutdown();server.server_close();thread.join(3)
+
+
+class ReportPersistenceTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name)/'reports'
+
+    def state(self):
+        return dict(status='completed',source='telegram-public',write=False,error='',exit_code=0,
+                    operation='search',report={'source':'telegram-public','decisions':[], 'manual_reviews':[]})
+
+    def test_restore_keeps_report_but_never_restores_confirmation_token(self):
+        controller = Controller(report_dir=self.path)
+        self.assertFalse(self.path.exists())
+        controller.state = self.state()
+        controller.review_preview = {'token':'must-not-persist'}
+        controller._persist_report()
+        restored = Controller(report_dir=self.path)
+        self.assertEqual(restored.snapshot()['report'],controller.state['report'])
+        self.assertTrue(restored.snapshot()['restored'])
+        self.assertIsNone(restored.review_preview)
+        self.assertNotIn('must-not-persist',(self.path/'latest.json').read_text(encoding='utf-8'))
+
+    def test_login_does_not_replace_last_search(self):
+        controller = Controller(report_dir=self.path)
+        controller.state = self.state()
+        controller._persist_report()
+        original = (self.path/'latest.json').read_bytes()
+        controller.state.update(operation='login',report={'session_status':'saved_unverified'})
+        controller._persist_report()
+        self.assertEqual((self.path/'latest.json').read_bytes(),original)
+
+    def test_corruption_and_oversized_report_are_visible_and_preserved(self):
+        self.path.mkdir()
+        for raw in ('broken JSON','{}','x'*2_000_001):
+            with self.subTest(size=len(raw)):
+                (self.path/'latest.json').write_text(raw,encoding='utf-8')
+                restored = Controller(report_dir=self.path)
+                self.assertEqual(restored.snapshot()['status'],'idle')
+                self.assertIn('report_warning',restored.snapshot())
+                self.assertEqual((self.path/'latest.json').read_text(encoding='utf-8'),raw)
+
+    def test_failed_atomic_save_preserves_previous_report_and_cleans_temporary(self):
+        controller = Controller(report_dir=self.path)
+        controller.state = self.state()
+        controller._persist_report()
+        original = (self.path/'latest.json').read_bytes()
+        controller.state['report']['decisions'] = [{'decision':'review'}]
+        with patch('control_panel.os.replace',side_effect=OSError('private detail')):
+            controller._persist_report()
+        self.assertEqual((self.path/'latest.json').read_bytes(),original)
+        self.assertEqual([p.name for p in self.path.iterdir()],['latest.json'])
+        self.assertNotIn('private detail',controller.state['report_warning'])
+        self.assertEqual(controller.state['report']['decisions'],[{'decision':'review'}])
+
+    def test_symlink_report_is_never_followed(self):
+        outside = self.path.parent/'outside.json'
+        outside.write_text('keep',encoding='utf-8')
+        self.path.mkdir()
+        try:
+            (self.path/'latest.json').symlink_to(outside)
+        except OSError:
+            self.skipTest('Symlinks unavailable on this Windows runner')
+        controller = Controller(report_dir=self.path)
+        controller.state = self.state()
+        controller._persist_report()
+        self.assertEqual(outside.read_text(encoding='utf-8'),'keep')
+        self.assertIn('report_warning',controller.state)
+
+
+class PanelTableReadTests(unittest.TestCase):
+    def test_three_schemas_are_read_only_and_empty_read_creates_nothing(self):
+        import tempfile
+        from pathlib import Path
+        from safe_writer import SafeWriter
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)/'data-root'
+            controller = Controller(report_dir=False)
+            writer = SafeWriter(root)
+            for name,count in [('advertisers',22),('telegram',14),('streamers',13)]:
+                result = controller.table_snapshot(name,writer=writer)
+                self.assertEqual(len(result['columns']),count)
+                self.assertEqual(result['rows'],[])
+            self.assertFalse(root.exists())
+            with self.assertRaises(ValueError):
+                controller.table_snapshot('../.env',writer=writer)
+
+    def test_existing_file_bytes_remain_unchanged(self):
+        import tempfile
+        from pathlib import Path
+        from safe_writer import SafeWriter
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            writer = SafeWriter(root)
+            writer.upsert('telegram',{'Название':'Канал','Ссылка':'https://t.me/example_channel'},dry_run=False)
+            original = (root/'data/telegram.csv').read_bytes()
+            rows = Controller(report_dir=False).table_snapshot('telegram',writer=writer)['rows']
+            self.assertEqual(rows[0]['Название'],'Канал')
+            self.assertEqual((root/'data/telegram.csv').read_bytes(),original)
+
+
+class AdvertiserFactsPanelTests(unittest.TestCase):
+    def options(self):
+        from datetime import datetime, timezone
+        url = 'https://www.wildberries.ru/catalog/123/detail.aspx'
+        fact = {'value':'Example Brand','url':url,'checked_at':datetime.now(timezone.utc).isoformat(),'operator_verified':True}
+        return dict(source='wb-web',countries=['ru'],limit=1,seed=url,write=False,
+                    proofs={url:{'brand':fact}},facts_verified=True,enrich_sites=True)
+
+    def test_verified_file_and_site_flag_are_validated_without_files(self):
+        args = build_command(self.options())
+        self.assertIn('--enrich-sites',args)
+        self.assertNotIn('--brand-proofs',args)  # File created only for an actual process.
+
+    def test_unconfirmed_stale_wrong_platform_and_malformed_facts_are_rejected(self):
+        from copy import deepcopy
+        options = self.options()
+        variants = [dict(options,facts_verified=False),dict(options,source='twitch-web'),dict(options,proofs=[])]
+        for change in ({'operator_verified':False},{'checked_at':'2020-01-01T00:00:00+00:00'},{'url':'not a URL'},{'value':None}):
+            value = deepcopy(options)
+            next(iter(value['proofs'].values()))['brand'].update(change)
+            variants.append(value)
+        for value in variants:
+            with self.subTest(value=value),self.assertRaises(ValueError):
+                build_command(value)
+
+    def test_facts_file_reaches_worker_and_is_cleaned_after_exit(self):
+        import tempfile
+        from pathlib import Path
+        options = self.options()
+        process = MagicMock()
+        process.stdout = io.BytesIO(b'{"source":"wb-web","status":"completed","decisions":[]}')
+        process.stderr = io.BytesIO(b'')
+        process.returncode = 0
+        captured = []
+        def spawn(args,**kwargs):
+            file = Path(args[args.index('--brand-proofs')+1])
+            self.assertEqual(json.loads(file.read_text(encoding='utf-8')),options['proofs'])
+            captured.append(file)
+            self.assertEqual(kwargs['stdin'],__import__('subprocess').DEVNULL)
+            return process
+        with tempfile.TemporaryDirectory() as folder,patch('config.CACHE_DIR',Path(folder)/'cache'),patch('control_panel.subprocess.Popen',side_effect=spawn):
+            controller = Controller(report_dir=False)
+            controller.start(options)
+            for _ in range(300):
+                if controller.snapshot()['status'] != 'running':
+                    break
+                time.sleep(.01)
+            self.assertEqual(controller.snapshot()['status'],'completed')
+            self.assertTrue(captured)
+            self.assertFalse(captured[0].exists())
+
+    def test_schedule_keeps_explicit_facts_without_schema_change(self):
+        import tempfile
+        from pathlib import Path
+        from control_panel import Scheduler
+        with tempfile.TemporaryDirectory() as folder:
+            controller = MagicMock()
+            controller.snapshot.return_value={'status':'idle'}
+            scheduler = Scheduler(controller,Path(folder)/'autonomy.sqlite3')
+            try:
+                options = self.options()
+                scheduler.add(options,300)
+                self.assertEqual(scheduler.jobs()[0]['options']['proofs'],options['proofs'])
+            finally:
+                scheduler.close()
