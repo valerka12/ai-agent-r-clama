@@ -662,6 +662,18 @@ class ReportPersistenceTests(unittest.TestCase):
         self.assertIsNone(restored.review_preview)
         self.assertNotIn('must-not-persist',(self.path/'latest.json').read_text(encoding='utf-8'))
 
+    def test_failure_without_report_keeps_previous_candidates(self):
+        controller = Controller(report_dir=self.path)
+        controller.state = self.state()
+        controller._persist_report()
+        original = (self.path/'latest.json').read_bytes()
+        controller.state.update(status='cancelled',report=None,error='Остановлено',exit_code=-15)
+        controller._persist_report()
+        self.assertEqual((self.path/'latest.json').read_bytes(),original)
+        restored = Controller(report_dir=self.path).snapshot()
+        self.assertEqual(restored['status'],'completed')
+        self.assertEqual(restored['report'],self.state()['report'])
+
     def test_login_does_not_replace_last_search(self):
         controller = Controller(report_dir=self.path)
         controller.state = self.state()

@@ -218,7 +218,8 @@ class Controller:
             self.state['report_warning'] = 'Последний отчёт не удалось восстановить. Исходный файл оставлен без изменений.'
 
     def _persist_report(self):
-        if self.report_dir is None or self.state.get('operation') == 'login':
+        if (self.report_dir is None or self.state.get('operation') == 'login'
+                or not isinstance(self.state.get('report'), dict)):
             return
         temporary = None
         try:
