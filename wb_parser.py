@@ -172,6 +172,9 @@ def assess_brand(product, proofs, *, niche=None, now=None, marketplace_metrics=T
         rating, reviews = product.get("reviewRating"), product.get("feedbacks")
         if isinstance(rating, bool) or not isinstance(rating, (int, float)) or not math.isfinite(rating):
             result["reasons"].append("Нет подтверждённого рейтинга товара.")
+        elif not 0 <= rating <= 5:
+            result["decision"] = "reject"
+            result["reasons"].append("Рейтинг товара вне допустимого диапазона 0–5.")
         elif rating < config.WB_MIN_RATING:
             result["decision"] = "reject"
             result["reasons"].append("Рейтинг товара ниже порога.")
@@ -418,6 +421,87 @@ class BrowserBatchError(SourceError):
         self.decisions = decisions
 
 
+
+def browser_failure_message(error):
+    """Классификация сбоя без вывода сырых логов браузера и секретов."""
+    text = str(error).lower()
+    if 'executable doesn' in text and 'exist' in text:
+        return 'browser_unavailable: Chromium не установлен или не найден. Переустановите полную сборку с папкой browser_engine; для запуска из исходников установите браузер по README.'
+    if 'machportrendezvous' in text and 'permission denied' in text:
+        return 'browser_unavailable: среда запуска запретила системный процесс Chromium. Запустите приложение напрямую в обычном сеансе macOS. Сайты ещё не проверены; повторный вход это не исправляет.'
+    if 'singletonlock' in text or 'processsingleton' in text:
+        return 'browser_unavailable: рабочий профиль занят другим процессом. Закройте окно входа или второй экземпляр приложения и повторите запуск. Файлы профиля не удаляйте.'
+    return 'Браузерный сбор прерван. Запись пакета запрещена.'
+
+
+def browser_profile_dir(platform):
+    """Только выделенные профили проекта; личные профили браузеров не используются."""
+    allowed = {'wb', 'ozon', 'instagram', 'youtube', 'twitch', 'kick', 'tgstat'}
+    if platform not in allowed:
+        raise SourceError('Неизвестная платформа профиля браузера.')
+    root = config.CACHE_DIR / 'browser_profiles'
+    path = root / platform
+    for directory in (config.CACHE_DIR, root, path):
+        if directory.is_symlink():
+            raise SourceError('Символьные ссылки для браузерных профилей запрещены.')
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    root.chmod(0o700)
+    path.chmod(0o700)
+    return path
+
+
+def setup_browser_session(platform):
+    """Первый вход в выделенный профиль; закрытие окна сохраняет сессию.
+
+    Наличие профиля не доказывает авторизацию. Следующий сбор проверяет доступ.
+    Пароли, OTP и cookies не читаются и не попадают в отчёт.
+    """
+    import os
+    from playwright.sync_api import sync_playwright, Error as BrowserError
+    homes = {
+        'tgstat': 'https://tgstat.ru/', 'wb': 'https://www.wildberries.ru/',
+        'ozon': 'https://www.ozon.ru/', 'instagram': 'https://www.instagram.com/',
+        'youtube': 'https://www.youtube.com/', 'twitch': 'https://www.twitch.tv/',
+        'kick': 'https://kick.com/',
+    }
+    if platform not in homes:
+        raise SourceError('Неизвестная платформа входа.')
+    profile = browser_profile_dir(platform)
+    os.environ.setdefault('PLAYWRIGHT_BROWSERS_PATH', str(config.CACHE_DIR / 'ms-playwright'))
+    closed = False
+    def mark_closed(*args):
+        nonlocal closed
+        closed = True
+    try:
+        with sync_playwright() as engine:
+            context = engine.chromium.launch_persistent_context(
+                user_data_dir=str(profile), headless=False, locale='ru-RU', accept_downloads=False)
+            try:
+                context.on('close', mark_closed)
+                page = context.pages[0] if context.pages else context.new_page()
+                response = page.goto(homes[platform], wait_until='domcontentloaded', timeout=30000)
+                if response is None or response.status >= 400:
+                    raise SourceError('Страница входа недоступна. Восстановите доступ обычным способом.')
+                deadline = time.monotonic() + 840
+                while not closed and time.monotonic() < deadline:
+                    try:
+                        page.wait_for_timeout(500)
+                    except BrowserError:
+                        if not closed and not page.is_closed():
+                            raise
+                        break
+                if not closed and not page.is_closed():
+                    raise SourceError('Время настройки истекло. Проверьте вход при следующем запуске.')
+            finally:
+                if not closed:
+                    context.close()
+    except BrowserError as error:
+        raise SourceError('Не удалось открыть отдельный профиль. Закройте другие процессы этой платформы и проверьте установку Chromium.') from error
+    return {'status': 'completed', 'session_setup': platform, 'session_status': 'saved_unverified',
+            'message': 'Профиль сохранён. Авторизация будет проверена при сборе.',
+            'dry_run': True, 'summary': {'total': 0, 'failed': 0}, 'results': []}
+
+
 class VisibleBrowserSource(Source):
     """Общий браузер для согласованных модулей. Только видимый DOM, без API.
 
@@ -449,7 +533,14 @@ class VisibleBrowserSource(Source):
         return value.rstrip("/")
 
     def collect(self, *, urls=None, payload=None, proofs=None, countries=("ru", "by"),
-                limit=5, niche=None, interactive_login=False, discover=False):
+                limit=5, niche=None, interactive_login=False, discover=False, keep_session=False, unattended=False):
+        if type(unattended) is not bool or (unattended and interactive_login):
+            raise SourceError("Автономный режим несовместим с ручным входом.")
+        self.unattended = unattended
+        keep_session = keep_session or unattended
+        if type(keep_session) is not bool:
+            raise SourceError("keep_session должен быть bool.")
+        self.keep_session = keep_session
         self.discover = discover
         if discover and (urls or payload is not None or not getattr(self, "catalog_url", None)):
             raise SourceError("Автопоиск доступен WB/Ozon/Twitch/Kick и не смешивается с прямыми ссылками/снимками.")
@@ -499,9 +590,16 @@ class VisibleBrowserSource(Source):
         os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(config.CACHE_DIR / "ms-playwright"))
         try:
             with sync_playwright() as engine:
-                browser = engine.chromium.launch(headless=False)
+                browser = None
+                context = None
                 try:
-                    context = browser.new_context(locale="ru-RU", accept_downloads=False)
+                    if getattr(self, "keep_session", False):
+                        context = engine.chromium.launch_persistent_context(
+                            user_data_dir=str(browser_profile_dir(self.platform.lower())),
+                            headless=getattr(self, "unattended", False), locale="ru-RU", accept_downloads=False)
+                    else:
+                        browser = engine.chromium.launch(headless=False)
+                        context = browser.new_context(locale="ru-RU", accept_downloads=False)
                     page = context.new_page()
                     if getattr(self, "discover", False):
                         urls = self._discover_urls(page)
@@ -515,8 +613,8 @@ class VisibleBrowserSource(Source):
                         # Публичные страницы обрабатываются без Enter на каждой карточке.
                         # Кнопка «Войти» в шапке сама по себе не означает закрытый профиль.
                         if self._login_required(page):
-                            if not getattr(self, "interactive_login", False) or not sys.stdin.isatty():
-                                raise SourceError("Нужен вход. Повторите с --interactive-login в обычном терминале.")
+                            if getattr(self, "unattended", False) or not getattr(self, "interactive_login", False) or not sys.stdin.isatty():
+                                raise SourceError("auth_required: сохранённый вход недоступен. Авторизуйте рабочий аккаунт отдельно; автономный сбор не ожидает ввода.")
                             input("Войдите в открытом окне и нажмите Enter один раз. ")
                             if self._login_required(page):
                                 raise SourceError("Вход не завершён; пакет не записан.")
@@ -534,9 +632,12 @@ class VisibleBrowserSource(Source):
                         capture["observed_at"] = datetime.now(timezone.utc).isoformat()
                         consume(capture)
                 finally:
-                    browser.close()
+                    if browser is not None:
+                        browser.close()
+                    elif context is not None:
+                        context.close()
         except (BrowserError, EOFError, KeyboardInterrupt) as error:
-            raise SourceError("Браузерный сбор прерван. Запись пакета запрещена.") from error
+            raise SourceError(browser_failure_message(error)) from error
 
     def _discover_urls(self, page):
         from urllib.parse import urljoin
@@ -582,6 +683,42 @@ class VisibleBrowserSource(Source):
         if capture.get("has_chat"):
             raise SourceError("В область профиля попал чат; сбор остановлен до уточнения селектора.")
         return capture
+
+    def _marketplace_brand(self, capture):
+        """Только явная видимая ссылка бренда; продавец/заголовок не подставляются."""
+        import re
+        links = capture.get('brand_links', [])
+        if self.platform not in {'WB', 'Ozon'} or not isinstance(links, list) or not links:
+            return None
+        brands = set()
+        for link in links:
+            if not isinstance(link, dict) or link.get('visible') is not True:
+                return None
+            name, url = link.get('name'), link.get('url')
+            if not isinstance(name, str) or not isinstance(url, str):
+                return None
+            name = ' '.join(name.split())
+            if (not 2 <= len(name) <= 150 or not any(char.isalpha() for char in name)
+                    or name.casefold() in {'без бренда', 'нет бренда', 'no brand', 'noname',
+                                           'бренд', 'магазин', 'перейти в магазин', 'brand',
+                                           'официальный магазин', 'все товары бренда', 'товары бренда',
+                                           'логотип бренда', 'логотип', 'logo'}):
+                return None
+            try:
+                validate_url(url)
+                parsed = urlsplit(url)
+                path = r'/brands/[^/]+/?' if self.platform == 'WB' else r'/brand/[^/]+/?'
+                if (parsed.scheme != 'https' or parsed.hostname not in self.hosts
+                        or parsed.port is not None or parsed.query or parsed.fragment
+                        or not re.fullmatch(path, parsed.path)):
+                    return None
+            except (ValueError, ValidationError):
+                return None
+            brands.add((name, url.rstrip('/')))
+        if len(brands) != 1:
+            return None
+        name, url = brands.pop()
+        return {'name': name, 'url': url, 'operator_verified': False}
 
     def decide(self, capture, proofs, countries, niche):
         """Факты оператора связаны с конкретной страницей; текст не даёт прав записи."""
@@ -642,7 +779,12 @@ class VisibleBrowserSource(Source):
             bound = (isinstance(brand_fact, dict) and brand_fact.get("url", "").rstrip("/") == url
                      and isinstance(brand, str) and brand.strip()
                      and brand.casefold() in text.casefold())
-            if not bound:
+            observed_brand = self._marketplace_brand(capture) if fresh else None
+            if observed_brand is not None and bound and observed_brand['name'].casefold() != brand.strip().casefold():
+                reasons.append('Видимый бренд противоречит проверенному факту brand.')
+            if observed_brand is not None and not bound:
+                brand = observed_brand['name']
+            if not bound and observed_brand is None:
                 reasons.append("Бренд не подтверждён на этой странице; нужен факт brand со ссылкой на неё.")
                 decision = {"candidate": {}, "decision": "review", "score": None, "reasons": []}
             else:
@@ -670,7 +812,8 @@ class VisibleBrowserSource(Source):
                         contact_suggestions=placement["contacts"])
         if self.platform in {"WB", "Ozon"}:
             decision["product_observation"] = {"title": capture.get("title"),
-                                                "metrics": capture.get("product_metrics", {})}
+                                                "metrics": capture.get("product_metrics", {}),
+                                                "brand": observed_brand}
         return decision
 
 
@@ -689,7 +832,10 @@ class WBWebSource(VisibleBrowserSource):
             const title = root.querySelector('[class*="productTitle--"]');
             const content = root.querySelector('[class*="productPageContent--"]');
             return {url:location.href, title:title?.innerText || '',
-                text:(content?.innerText || '').split('Характеристики и описание')[0].slice(0,10000)};
+                text:(content?.innerText || '').split('Характеристики и описание')[0].slice(0,10000),
+                brand_links:Array.from(root.querySelectorAll('a[class*="brand"][href*="/brands/"], [class*="brand"] a[href*="/brands/"]'))
+                    .filter(e=>e.getClientRects().length && getComputedStyle(e).visibility!=='hidden')
+                    .map(e=>({name:e.innerText.trim() || e.querySelector('img')?.alt || '',url:e.href,visible:true}))};
         }""")
         import re
         matches = re.findall(r'(?m)^([0-5][.,][0-9])\s*[·•]\s*([0-9][0-9\s]*)\s+оцен(?:ка|ки|ок)\s*$', capture['text'])

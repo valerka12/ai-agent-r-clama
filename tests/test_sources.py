@@ -243,7 +243,7 @@ class SourceIntegrationTests(unittest.TestCase):
             row = writer.read("telegram")[0]
             self.assertEqual(row["Подписчики"], "2000")
             self.assertEqual(row["Контакт"], "")
-            self.assertIn('source_run', (writer.root/"logs"/"agent.log").read_text())
+            self.assertIn('source_run', (writer.root/"logs"/"agent.log").read_text(encoding="utf-8"))
 
     def test_wb_full_pipeline_protects_manual_fields(self):
         product, proofs = brand_data()
@@ -952,5 +952,481 @@ class MarketplaceBrowserLayoutTests(unittest.TestCase):
         self.assertEqual(YouTubeWebSource.ready_selector, 'yt-page-header-renderer h1')
 
 
+class PersistentBrowserSessionTests(unittest.TestCase):
+    def test_profile_is_local_private_and_separate(self):
+        from wb_parser import browser_profile_dir
+        with tempfile.TemporaryDirectory() as directory, patch('config.CACHE_DIR', Path(directory) / 'cache'):
+            first = browser_profile_dir('instagram')
+            self.assertEqual(first, browser_profile_dir('instagram'))
+            self.assertNotEqual(first, browser_profile_dir('youtube'))
+            import os
+            if os.name != "nt":
+                self.assertEqual(first.stat().st_mode & 0o777, 0o700)
+            else:
+                self.assertTrue(first.is_dir())
+            with self.assertRaises(SourceError):
+                browser_profile_dir('../personal')
+
+    def test_profile_symlink_is_rejected(self):
+        from wb_parser import browser_profile_dir
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / 'cache'
+            cache.mkdir()
+            (cache / 'browser_profiles').symlink_to(Path(directory), target_is_directory=True)
+            with patch('config.CACHE_DIR', cache), self.assertRaises(SourceError):
+                browser_profile_dir('twitch')
+
+    def test_persistent_context_is_used_and_closed_without_prompt(self):
+        from unittest.mock import MagicMock
+        from twitch_parser import TwitchWebSource
+        source = TwitchWebSource()
+        source.keep_session = True
+        source.interactive_login = False
+        engine = MagicMock()
+        context = engine.chromium.launch_persistent_context.return_value
+        page = context.new_page.return_value
+        page.goto.return_value.status = 200
+        page.url = 'https://www.twitch.tv/nix'
+        page.locator.return_value.count.return_value = 0
+        page.locator.return_value.first.evaluate.return_value = {'url': page.url, 'text': 'Nix', 'has_chat': False}
+        with tempfile.TemporaryDirectory() as directory, patch('config.CACHE_DIR', Path(directory) / 'cache'), patch('playwright.sync_api.sync_playwright') as start, patch('builtins.input', side_effect=AssertionError('unexpected prompt')), contextlib.redirect_stderr(io.StringIO()):
+            start.return_value.__enter__.return_value = engine
+            source._browse([page.url], MagicMock())
+        engine.chromium.launch.assert_not_called()
+        engine.chromium.launch_persistent_context.assert_called_once()
+        context.close.assert_called_once()
+
+    def test_import_does_not_create_a_profile(self):
+        from twitch_parser import TwitchWebSource
+        with tempfile.TemporaryDirectory() as directory, patch('config.CACHE_DIR', Path(directory) / 'cache'):
+            TwitchWebSource().collect(payload={'captures': [{'url': 'https://www.twitch.tv/nix', 'text': 'Nix', 'observed_at': datetime.now(timezone.utc).isoformat()}]}, keep_session=True)
+            self.assertFalse((Path(directory) / 'cache').exists())
+
+
+class UnattendedModeTests(unittest.TestCase):
+    def test_all_six_collectors_use_headless_private_profiles(self):
+        from unittest.mock import MagicMock
+        from wb_parser import WBWebSource
+        from ozon_parser import OzonWebSource
+        from instagram_parser import InstagramWebSource
+        from youtube_parser import YouTubeWebSource
+        from twitch_parser import TwitchWebSource
+        from kick_parser import KickWebSource
+        cases = [(WBWebSource, 'https://www.wildberries.ru/catalog/123/detail.aspx'),
+                 (OzonWebSource, 'https://www.ozon.ru/product/item-123'),
+                 (InstagramWebSource, 'https://www.instagram.com/example'),
+                 (YouTubeWebSource, 'https://www.youtube.com/@example'),
+                 (TwitchWebSource, 'https://www.twitch.tv/example'),
+                 (KickWebSource, 'https://kick.com/example')]
+        with tempfile.TemporaryDirectory() as directory, patch('config.CACHE_DIR', Path(directory)/'cache'):
+            for cls, url in cases:
+                with self.subTest(platform=cls.platform):
+                    source = cls()
+                    engine = MagicMock()
+                    context = engine.chromium.launch_persistent_context.return_value
+                    page = context.new_page.return_value
+                    page.url = url
+                    page.goto.return_value.status = 200
+                    page.locator.return_value.count.return_value = 0
+                    capture = {'url': url, 'text': 'example'}
+                    with patch('playwright.sync_api.sync_playwright') as start, patch.object(source, '_capture', return_value=capture), patch('builtins.input', side_effect=AssertionError('prompt forbidden')), contextlib.redirect_stderr(io.StringIO()):
+                        start.return_value.__enter__.return_value = engine
+                        source.collect(urls=[url], unattended=True)
+                    self.assertTrue(engine.chromium.launch_persistent_context.call_args.kwargs['headless'])
+                    self.assertTrue(engine.chromium.launch_persistent_context.call_args.kwargs['user_data_dir'].endswith(cls.platform.lower()))
+                    context.close.assert_called_once()
+
+    def test_tgstat_unattended_uses_persistent_headless_context(self):
+        from unittest.mock import MagicMock
+        from tg_parser import TGStatWebSource
+        engine = MagicMock()
+        context = engine.chromium.launch_persistent_context.return_value
+        context.new_page.return_value.evaluate.return_value = {'url': 'https://tgstat.ru/channel/@example/stat', 'text': 'example'}
+        source = TGStatWebSource(prompt=MagicMock(side_effect=AssertionError('prompt forbidden')), sleep=lambda _: None, progress=lambda _: None)
+        source.unattended = True
+        source.keep_session = True
+        with tempfile.TemporaryDirectory() as directory, patch('config.CACHE_DIR', Path(directory)/'cache'), patch('playwright.sync_api.sync_playwright') as start, patch.object(source, '_visit'), patch.object(source, '_ensure_login'):
+            start.return_value.__enter__.return_value = engine
+            self.assertEqual(len(source._browse(['https://tgstat.ru/channel/@example/stat'], None, ('ru',), 1)), 1)
+        self.assertTrue(engine.chromium.launch_persistent_context.call_args.kwargs['headless'])
+        source.prompt.assert_not_called()
+        context.close.assert_called_once()
+
+    def test_expired_tgstat_session_never_prompts(self):
+        from unittest.mock import MagicMock
+        from playwright.sync_api import TimeoutError as BrowserTimeout
+        from tg_parser import TGStatWebSource
+        source = TGStatWebSource(prompt=MagicMock(side_effect=AssertionError('prompt forbidden')))
+        source.unattended = True
+        page = MagicMock()
+        page.locator.return_value.wait_for.side_effect = BrowserTimeout('expired')
+        with self.assertRaisesRegex(SourceError, 'auth_required'):
+            source._ensure_login(page, 'https://tgstat.ru/channel/@example/stat')
+        source.prompt.assert_not_called()
+
+    def test_expired_login_cannot_write(self):
+        from unittest.mock import MagicMock
+        from wb_parser import VisibleBrowserSource
+        engine = MagicMock()
+        context = engine.chromium.launch_persistent_context.return_value
+        page = context.new_page.return_value
+        page.url = 'https://www.twitch.tv/login'
+        page.goto.return_value.status = 200
+        with tempfile.TemporaryDirectory() as directory, patch('config.CACHE_DIR', Path(directory)/'cache'), patch('playwright.sync_api.sync_playwright') as start, patch('builtins.input', side_effect=AssertionError('prompt forbidden')), contextlib.redirect_stderr(io.StringIO()):
+            start.return_value.__enter__.return_value = engine
+            data = Path(directory)/'storage'
+            report = run_source('twitch-web', urls=['https://www.twitch.tv/example'], limit=1, unattended=True, dry_run=False, writer=SafeWriter(data))
+            self.assertEqual(report['status'], 'stopped')
+            self.assertTrue(report['dry_run'])
+            self.assertIn('auth_required', report['source_error']['reason'])
+            self.assertFalse(data.exists())
+
+    def test_unattended_rejects_interactive_login_and_import(self):
+        for kwargs in ({'interactive_login': True}, {'payload': {'captures': []}}):
+            with self.assertRaises(ValueError):
+                run_source('twitch-web', unattended=True, **kwargs)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class SessionSetupTests(unittest.TestCase):
+    def test_seven_platforms_use_only_dedicated_visible_profiles(self):
+        from unittest.mock import MagicMock
+        from wb_parser import setup_browser_session
+        from playwright.sync_api import Error as BrowserError
+        for platform in ('tgstat', 'wb', 'ozon', 'instagram', 'youtube', 'twitch', 'kick'):
+            with self.subTest(platform=platform), tempfile.TemporaryDirectory() as directory, patch('config.CACHE_DIR', Path(directory)):
+                engine = MagicMock()
+                context = engine.chromium.launch_persistent_context.return_value
+                page = context.pages[0]
+                page.goto.return_value.status = 200
+                callbacks = {}
+                context.on.side_effect = lambda name, callback: callbacks.update({name: callback})
+                def closed(*args):
+                    callbacks['close']()
+                    raise BrowserError('Target closed')
+                page.wait_for_timeout.side_effect = closed
+                with patch('playwright.sync_api.sync_playwright') as api:
+                    api.return_value.__enter__.return_value = engine
+                    report = setup_browser_session(platform)
+                params = engine.chromium.launch_persistent_context.call_args.kwargs
+                self.assertFalse(params['headless'])
+                self.assertEqual(Path(params['user_data_dir']), Path(directory)/'browser_profiles'/platform)
+                self.assertEqual(report['session_status'], 'saved_unverified')
+                self.assertEqual(report['summary']['total'], 0)
+                context.cookies.assert_not_called()
+                context.storage_state.assert_not_called()
+
+    def test_unknown_platform_creates_nothing(self):
+        from wb_parser import setup_browser_session
+        with tempfile.TemporaryDirectory() as directory, patch('config.CACHE_DIR', Path(directory)/'cache'):
+            with self.assertRaises(SourceError):
+                setup_browser_session('../personal')
+            self.assertFalse((Path(directory)/'cache').exists())
+
+    def test_denied_login_page_closes_context_and_never_claims_login(self):
+        from unittest.mock import MagicMock
+        from wb_parser import setup_browser_session
+        engine = MagicMock()
+        context = engine.chromium.launch_persistent_context.return_value
+        context.pages[0].goto.return_value.status = 403
+        with tempfile.TemporaryDirectory() as directory, patch('config.CACHE_DIR', Path(directory)), patch('playwright.sync_api.sync_playwright') as api:
+            api.return_value.__enter__.return_value = engine
+            with self.assertRaises(SourceError):
+                setup_browser_session('tgstat')
+            context.close.assert_called_once()
+
+    def test_setup_cli_forbids_write(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            main(['--setup-session', 'tgstat', '--write'])
+
+
+class SessionWindowCloseTests(unittest.TestCase):
+    def test_closing_page_before_context_close_is_normal_completion(self):
+        from unittest.mock import MagicMock
+        from playwright.sync_api import Error as BrowserError
+        from wb_parser import setup_browser_session
+        engine = MagicMock()
+        context = engine.chromium.launch_persistent_context.return_value
+        page = context.pages[0]
+        page.goto.return_value.status = 200
+        page.wait_for_timeout.side_effect = BrowserError('Target page closed')
+        page.is_closed.return_value = True
+        with tempfile.TemporaryDirectory() as directory, patch('config.CACHE_DIR', Path(directory)), patch('playwright.sync_api.sync_playwright') as api:
+            api.return_value.__enter__.return_value = engine
+            result = setup_browser_session('tgstat')
+        context.close.assert_called_once()
+        self.assertEqual(result['session_status'], 'saved_unverified')
+
+
+class TelegramPublicTests(unittest.TestCase):
+    @staticmethod
+    def page(username='example_channel', subscribers='2 000', kind='subscribers', description='Реклама: @public_manager'):
+        from html import escape
+        return ('<meta property="og:title" content="Проверяемый канал">'
+                '<meta property="og:description" content="'+escape(description, quote=True)+'">'
+                '<div class="tgme_page_extra">'+subscribers+' '+kind+'</div>'
+                '<a class="tgme_action_button_new" href="tg://resolve?domain='+username+'">View</a>')
+
+    class HTTP:
+        def __init__(self, page, records=None):
+            self.page, self.records, self.calls = page, records, []
+        def get(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            return {'data': self.records} if '/api/v1/' in url else self.page
+
+    def test_direct_channel_reads_public_exact_count_but_never_auto_accepts(self):
+        from tg_parser import TelegramPublicSource
+        http = self.HTTP(self.page())
+        result = TelegramPublicSource(http).collect(channels=['@example_channel'], countries=['ru'], limit=1)[0]
+        self.assertEqual(result['candidate']['Подписчики'], 2000)
+        self.assertEqual(result['decision'], 'review')
+        self.assertIsNone(result['evidence']['country'])
+        self.assertEqual(result['contact_suggestions'], ['@public_manager'])
+        for field in ('Средний охват', 'ERR (%)', 'Контакт', 'Стоимость 1/24'):
+            self.assertNotIn(field, result['candidate'])
+        self.assertEqual(len(http.calls), 1)
+
+    def test_discovery_ignores_estimated_metrics_and_unverified_geo(self):
+        from tg_parser import TelegramPublicSource
+        http = self.HTTP(self.page(), [{'username':'example_channel','avgViews':160,'country':'ru','members':999999,'estimatedCpm':5}])
+        result = TelegramPublicSource(http).collect(query='Беларусь', countries=['by'], limit=1)[0]
+        self.assertEqual(result['candidate']['Подписчики'], 2000)
+        self.assertEqual(result['decision'], 'review')
+        self.assertNotIn('Средний охват', result['candidate'])
+        self.assertIsNone(result['evidence']['country'])
+        self.assertEqual(http.calls[0][1]['params']['q'], 'Беларусь')
+
+    def test_country_words_are_search_terms_not_country_evidence(self):
+        from tg_parser import TelegramPublicSource
+        class HTTP(self.HTTP):
+            def get(self, url, **kwargs):
+                if '/api/v1/' in url:
+                    self.calls.append((url, kwargs))
+                    return {'data': []}
+                return super().get(url, **kwargs)
+        http = HTTP(self.page())
+        self.assertEqual(TelegramPublicSource(http).collect(countries=['ru','by'], limit=2), [])
+        self.assertEqual([params['params']['q'] for _, params in http.calls], ['Россия', 'Беларусь'])
+
+    def test_rounded_counts_chats_and_wrong_identity_stay_out_of_candidate(self):
+        from tg_parser import TelegramPublicSource
+        for page in (self.page(subscribers='2K'), self.page(kind='members'), self.page(username='other_channel')):
+            with self.subTest(page=page):
+                result = TelegramPublicSource(self.HTTP(page)).collect(channels=['@example_channel'], limit=1)[0]
+                self.assertEqual(result['decision'], 'review')
+                self.assertEqual(result['candidate'], {})
+
+    def test_below_minimum_is_rejected(self):
+        from tg_parser import TelegramPublicSource
+        result = TelegramPublicSource(self.HTTP(self.page(subscribers='99'))).collect(channels=['@example_channel'], limit=1)[0]
+        self.assertEqual(result['decision'], 'reject')
+
+    def test_bad_parameters_fail_before_network(self):
+        from tg_parser import TelegramPublicSource
+        for kwargs in ({'query':'aa'}, {'limit':True}, {'countries':['us']}, {'channels':['https://evil.test/test']}, {'channels':['@example_channel'],'query':'test'}):
+            http = self.HTTP(self.page())
+            with self.subTest(kwargs=kwargs), self.assertRaises(SourceError):
+                TelegramPublicSource(http).collect(**kwargs)
+            self.assertEqual(http.calls, [])
+
+    def test_malformed_api_contract_fails_closed(self):
+        from tg_parser import TelegramPublicSource
+        with self.assertRaises(SourceError):
+            TelegramPublicSource(self.HTTP(self.page(), None)).collect(query='test', limit=1)
+
+    def test_source_denial_is_not_silently_retried_or_replaced(self):
+        from tg_parser import TelegramPublicSource
+        from unittest.mock import MagicMock
+        http = MagicMock()
+        http.get.side_effect = SourceError('HTTP 403')
+        with self.assertRaises(SourceError):
+            TelegramPublicSource(http).collect(query='test', limit=1)
+        self.assertEqual(http.get.call_count, 1)
+
+    def test_cli_write_is_rejected_before_source_call(self):
+        with contextlib.redirect_stderr(io.StringIO()), patch('tg_parser.TelegramPublicSource.collect') as collect, self.assertRaises(SystemExit):
+            main(['--source','telegram-public','--channels','@example_channel','--write'])
+        collect.assert_not_called()
+
+    def test_pipeline_is_unattended_preview_without_file_writes(self):
+        from tg_parser import TelegramPublicSource
+        records = TelegramPublicSource(self.HTTP(self.page())).collect(channels=['@example_channel'], limit=1)
+        with tempfile.TemporaryDirectory() as directory, patch('tg_parser.TelegramPublicSource.collect', return_value=records):
+            root = Path(directory)/'storage'
+            report = run_source('telegram-public', unattended=True, channels=['@example_channel'], dry_run=True, writer=SafeWriter(root))
+            self.assertEqual(report['source_summary']['review'], 1)
+            self.assertEqual(report['summary']['added'], 0)
+            self.assertFalse(root.exists())
+
+
+class PublicVisibleDescriptionTests(unittest.TestCase):
+    page = staticmethod(TelegramPublicTests.page)
+    HTTP = TelegramPublicTests.HTTP
+    def test_visible_advertising_line_keeps_contact_separate_from_editor(self):
+        from tg_parser import TelegramPublicSource
+        page = self.page(description='Описание\\tРеклама // @ad_manager\\tРедакция // @editor_manager')
+        page += '<div class="tgme_page_description">Описание<br/>Реклама // <a href="https://t.me/ad_manager">@ad_manager</a><br/>Редакция // @editor_manager</div>'
+        result = TelegramPublicSource(self.HTTP(page)).collect(channels=['@example_channel'], limit=1)[0]
+        self.assertEqual(result['contact_suggestions'], ['@ad_manager'])
+        self.assertEqual(result['placement']['status'], 'offered')
+        self.assertEqual(result['decision'], 'review')
+        self.assertNotIn('Контакт', result['candidate'])
+
+    def test_ambiguous_visible_descriptions_do_not_create_candidate(self):
+        from tg_parser import TelegramPublicSource
+        page = self.page() + '<div class="tgme_page_description">Реклама @first_manager</div><div class="tgme_page_description">Реклама @second_manager</div>'
+        result = TelegramPublicSource(self.HTTP(page)).collect(channels=['@example_channel'], limit=1)[0]
+        self.assertEqual(result['candidate'], {})
+        self.assertEqual(result['decision'], 'review')
+
+
+class BrowserFailureDiagnosticTests(unittest.TestCase):
+    def test_known_startup_failures_are_actionable_and_hide_raw_details(self):
+        from wb_parser import browser_failure_message
+        for raw,expected in (("Executable doesn't exist at /private/secret", 'Chromium не установлен'),
+                             ('MachPortRendezvousServer Permission denied private-token', 'Сайты ещё не проверены'),
+                             ('ProcessSingleton SingletonLock private-token', 'профиль занят')):
+            with self.subTest(raw=raw):
+                message = browser_failure_message(RuntimeError(raw))
+                self.assertIn(expected, message)
+                self.assertNotIn('private-token', message)
+                self.assertNotIn('/private/secret', message)
+
+    def test_unknown_error_never_discloses_browser_log(self):
+        from wb_parser import browser_failure_message
+        message = browser_failure_message(RuntimeError('https://user:secret@example.test'))
+        self.assertEqual(message, 'Браузерный сбор прерван. Запись пакета запрещена.')
+
+
+class AdvertiserBrandObservationTests(unittest.TestCase):
+    def capture(self, platform='WB'):
+        now = datetime.now(timezone.utc).isoformat()
+        if platform == 'WB':
+            url,brand_url = 'https://www.wildberries.ru/catalog/123/detail.aspx','https://www.wildberries.ru/brands/example'
+        else:
+            url,brand_url = 'https://www.ozon.ru/product/item-123','https://www.ozon.ru/brand/example-123'
+        return {'url':url,'title':'Проверяемый товар','text':'Example Brand\nПроверяемый товар\n4.9 • 1000 отзывов',
+                'observed_at':now,'product_metrics':{'reviewRating':4.9,'feedbacks':1000},
+                'brand_links':[{'name':'Example Brand','url':brand_url,'visible':True}]}
+
+    def sources(self):
+        from wb_parser import WBWebSource
+        from ozon_parser import OzonWebSource
+        return WBWebSource(), OzonWebSource()
+
+    def test_explicit_brand_is_a_candidate_without_invented_country_or_contacts(self):
+        for source in self.sources():
+            capture = self.capture(source.platform)
+            result = source.collect(payload={'captures':[capture]})[0]
+            self.assertEqual(result['candidate']['Название компании'],'Example Brand')
+            self.assertEqual(result['candidate']['Рекламируемый продукт'],'Проверяемый товар')
+            self.assertEqual(result['decision'],'review')
+            self.assertIs(result['product_observation']['brand']['operator_verified'],False)
+            for field in ('Страна','Сайт','Telegram/почта','Комментарий'):
+                self.assertNotIn(field,result['candidate'])
+
+    def test_product_title_or_seller_cannot_substitute_for_brand(self):
+        for source in self.sources():
+            capture = self.capture(source.platform)
+            capture.pop('brand_links')
+            capture['text'] = 'Продавец: Example Brand\nТовар Example Brand'
+            result = source.collect(payload={'captures':[capture]})[0]
+            self.assertEqual(result['candidate'],{})
+            self.assertEqual(result['decision'],'review')
+
+    def test_ambiguous_hidden_or_external_brand_link_is_not_used(self):
+        from copy import deepcopy
+        source = self.sources()[0]
+        capture = self.capture()
+        bad = []
+        for updates in ({'visible':False},{'url':'https://other.test/brands/example'},
+                        {'url':'https://www.wildberries.ru/seller/123'},
+                        {'url':'https://www.wildberries.ru/brands/example?token=x'},
+                        {'name':'Без бренда'}, {'name':''}):
+            item = deepcopy(capture)
+            item['brand_links'][0].update(updates)
+            bad.append(item)
+        item = deepcopy(capture)
+        item['brand_links'].append({'name':'Another','url':'https://www.wildberries.ru/brands/another','visible':True})
+        bad.append(item)
+        for item in bad:
+            with self.subTest(item=item['brand_links']):
+                result = source.collect(payload={'captures':[item]})[0]
+                self.assertEqual(result['candidate'],{})
+                self.assertNotEqual(result['decision'],'accept')
+
+    def test_stale_observation_does_not_produce_current_brand(self):
+        capture = self.capture()
+        capture['observed_at'] = '2020-01-01T00:00:00+00:00'
+        result = self.sources()[0].collect(payload={'captures':[capture]})[0]
+        self.assertEqual(result['candidate'],{})
+        self.assertIsNone(result['product_observation']['brand'])
+
+    def test_conflicting_verified_brand_remains_review(self):
+        capture = self.capture()
+        capture['text'] += '\nOther Brand'
+        now = datetime.now(timezone.utc)
+        fact = proof('Other Brand',now)
+        fact['url'] = capture['url']
+        result = self.sources()[0].collect(payload={'captures':[capture]},proofs={capture['url']:{'brand':fact}})[0]
+        self.assertNotEqual(result['decision'],'accept')
+        self.assertTrue(any('противоречит' in reason for reason in result['reasons']))
+
+    def test_invalid_rating_is_rejected_before_quality_acceptance(self):
+        product,proofs,now = self.verified_brand()
+        for rating in (5.1,6,100):
+            with self.subTest(rating=rating):
+                result = assess_brand(dict(product,reviewRating=rating),proofs,now=now)
+                self.assertEqual(result['decision'],'reject')
+
+    @staticmethod
+    def verified_brand():
+        now = datetime.now(timezone.utc)
+        return {'brand':'Example Brand','reviewRating':4.9,'feedbacks':1000},{'brand':proof('Example Brand',now)},now
+
+    def test_browser_import_preview_never_writes_provisional_advertisers(self):
+        from wb_parser import WBWebSource
+        capture = self.capture()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)/'storage'
+            report = run_source('wb-web',payload={'captures':[capture]},writer=SafeWriter(root),dry_run=True)
+            self.assertEqual(report['source_summary']['review'],1)
+            self.assertEqual(report['summary']['added'],0)
+            self.assertFalse(root.exists())
+
+
+class BrowserAdvertiserEnrichmentTests(unittest.TestCase):
+    def inputs(self):
+        product, facts = brand_data()
+        url = 'https://www.wildberries.ru/catalog/123/detail.aspx'
+        facts['brand']['url'] = url
+        capture = {'url':url,'title':'Товар','text':product['brand'],
+                   'product_metrics':{'reviewRating':4.9,'feedbacks':1000},
+                   'observed_at':datetime.now(timezone.utc).isoformat()}
+        return capture,{url:facts}
+
+    def test_site_failure_downgrades_candidate_and_prevents_write(self):
+        capture,proofs = self.inputs()
+        with tempfile.TemporaryDirectory() as folder,patch('wb_parser.enrich_website',side_effect=SourceError('HTTP 403')):
+            root = Path(folder)/'storage'
+            report = run_source('wb-web',payload={'captures':[capture]},proofs=proofs,enrich_sites=True,
+                                dry_run=False,writer=SafeWriter(root))
+            self.assertEqual(report['source_summary']['accept'],0)
+            self.assertEqual(report['source_summary']['review'],1)
+            self.assertFalse((root/'data/advertisers.csv').exists())
+
+    def test_site_contacts_are_suggestions_and_manual_fields_are_not_written(self):
+        capture,proofs = self.inputs()
+        with tempfile.TemporaryDirectory() as folder,patch('wb_parser.enrich_website',return_value={'contact_suggestions':['sales@example.org'],'operator_verified':False}) as enrich:
+            writer = SafeWriter(Path(folder))
+            report = run_source('wb-web',payload={'captures':[capture]},proofs=proofs,enrich_sites=True,
+                                dry_run=False,writer=writer)
+            enrich.assert_called_once()
+            self.assertEqual(report['source_summary']['accept'],1)
+            row = writer.read('advertisers')[0]
+            self.assertEqual(row['Telegram/почта'],'')
+            self.assertEqual(row['Комментарий'],'')
+            self.assertEqual(report['decisions'][0]['enrichment']['contact_suggestions'],['sales@example.org'])

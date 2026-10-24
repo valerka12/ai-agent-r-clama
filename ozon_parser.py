@@ -28,6 +28,9 @@ class OzonWebSource(VisibleBrowserSource):
 
     def _capture(self, page):
         capture = super()._capture(page)
+        capture['brand_links'] = page.locator('[data-widget="webBrand"] a[href*="/brand/"]').evaluate_all(r'''els => els
+            .filter(e=>e.getClientRects().length && getComputedStyle(e).visibility!=='hidden')
+            .map(e=>({name:e.innerText.trim() || e.querySelector('img')?.alt || '',url:e.href,visible:true}))''')
         scores = page.locator('[data-widget="webSingleProductScore"]').all_text_contents()
         capture['text'] += '\n' + '\n'.join(scores)
         capture['product_metrics'] = self._product_metrics(scores)
